@@ -269,7 +269,8 @@ finished with `stop`, so no tool patch is parsed while the turn streams.
   services (`OPENCHAMBER_APPROVAL_ORIGINS`, read once per runtime by
   `stores/useApprovalOriginsStore.ts` from `/api/openchamber/approval-origins`),
   `markdown/markdownApprovalCards.ts` replaces a link whose origin is exactly
-  trusted, whose path is `/a/<id>`, and which sits alone in its paragraph with
+  trusted, whose path is `/a/<id>`, and which sits alone in its paragraph (the
+  favicon and preview button `decorate.ts` adds beside a link do not count) with
   a frame of the service's own card view (`/a/<id>?view=card`). The service
   draws the card and runs the approval, so the frame delegates
   `publickey-credentials-get` and nothing else. The frame starts 360px tall;

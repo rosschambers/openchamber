@@ -10,6 +10,8 @@
 
 import { z } from 'zod';
 
+import { MESSAGE_IMAGE_EXPORT_EXCLUDE_ATTRIBUTE } from '../message/imageExport';
+
 const APPROVAL_PATH_RE = /^\/a\/[A-Za-z0-9]+$/;
 const CARD_ATTR = 'data-openchamber-approval-card';
 const HEIGHT_MESSAGE_TYPE = 'herald-card-height';
@@ -30,11 +32,20 @@ const cardSource = (link: HTMLAnchorElement, trustedOrigins: readonly string[]):
   return `${url.origin}${url.pathname}?view=card`;
 };
 
-/** The paragraph a link fills on its own, or null when anything else shares it. */
+// What decorate.ts adds beside an external link: the favicon (kept out of
+// message image exports) and the loopback preview button.
+const LINK_DECORATION_SELECTOR = `[${MESSAGE_IMAGE_EXPORT_EXCLUDE_ATTRIBUTE}], [data-md-action="preview-loopback"]`;
+
+const isBlankOrDecoration = (node: ChildNode): boolean => {
+  if (node.nodeType === node.TEXT_NODE) return !node.textContent?.trim();
+  return node instanceof Element && node.matches(LINK_DECORATION_SELECTOR);
+};
+
+/** The paragraph a link fills on its own, apart from its decorations, or null when anything else shares it. */
 const ownParagraph = (link: HTMLAnchorElement): HTMLParagraphElement | null => {
   const paragraph = link.parentElement;
   if (!(paragraph instanceof HTMLParagraphElement)) return null;
-  const alone = Array.from(paragraph.childNodes).every((node) => node === link || (node.nodeType === node.TEXT_NODE && !node.textContent?.trim()));
+  const alone = Array.from(paragraph.childNodes).every((node) => node === link || isBlankOrDecoration(node));
   return alone ? paragraph : null;
 };
 

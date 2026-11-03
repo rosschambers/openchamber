@@ -69,6 +69,24 @@ describe('approval cards', () => {
     expect(container.textContent).toContain('After');
   });
 
+  test('the link decorations (favicon, loopback preview button) do not count as other content', () => {
+    // The shape decorate.ts leaves around an external link, as seen in a live message.
+    const favicon = '<span data-message-image-export-exclude="true" class="me-1 inline-flex"><img src="https://icons.example/approvals.ico" alt=""></span>';
+    const preview = '<button type="button" data-md-action="preview-loopback" data-md-url="http://127.0.0.1:8080/a/LOCAL1"></button>';
+    const container = mount(
+      `<p>${favicon}${link(`${TRUSTED}/a/ABC123`)}</p><p>${favicon}${link('http://127.0.0.1:8080/a/LOCAL1')}${preview}</p>`,
+      [TRUSTED, 'http://127.0.0.1:8080'],
+    );
+    expect(container.querySelectorAll('iframe')).toHaveLength(2);
+    expect(container.querySelector('a')).toBeNull();
+  });
+
+  test('a decoration does not hide other content beside the link', () => {
+    const favicon = '<span data-message-image-export-exclude="true"><img src="https://icons.example/approvals.ico" alt=""></span>';
+    const container = mount(`<p>${favicon}${link(`${TRUSTED}/a/ABC123`)} <strong>and more</strong></p>`);
+    expect(container.querySelector('iframe')).toBeNull();
+  });
+
   test('the same link inside a sentence stays a link', () => {
     const container = mount(`<p>Approve it here: ${link(`${TRUSTED}/a/ABC123`)} please</p>`);
     expect(container.querySelector('iframe')).toBeNull();
