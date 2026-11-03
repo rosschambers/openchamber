@@ -288,7 +288,7 @@ mock.module('./markdown/detachedMarkdownDomCache', () => ({
         store: () => undefined,
     },
 }));
-mock.module('@/lib/runtime-switch', () => ({ getRuntimeApiBaseUrl: () => '', getRuntimeKey: () => 'runtime' }));
+mock.module('@/lib/runtime-switch', () => ({ getRuntimeApiBaseUrl: () => '', getRuntimeKey: () => 'runtime', subscribeRuntimeEndpointChanged: () => () => undefined }));
 mock.module('@/lib/router/openSessionFromRoute', () => ({ openSessionLink: async () => undefined }));
 type TestDecorateContext = {
     labels: { copy: string };

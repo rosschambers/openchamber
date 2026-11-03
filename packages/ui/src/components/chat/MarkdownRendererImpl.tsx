@@ -106,14 +106,22 @@ const useMarkdownVideoFallback = (containerRef: React.RefObject<HTMLDivElement |
 // (markdown/markdownApprovalCards.ts). Only in settled assistant text: while
 // streaming, each re-render would put the link back and reload the card.
 const useApprovalCards = (containerRef: React.RefObject<HTMLDivElement | null>, enabled: boolean) => {
-  const origins = useApprovalOriginsStore((state) => state.origins);
-  React.useEffect(() => {
-    if (enabled) void useApprovalOriginsStore.getState().ensureLoaded();
-  }, [enabled]);
   React.useEffect(() => {
     const container = containerRef.current;
-    return enabled && container ? attachApprovalCards(container, origins) : undefined;
-  }, [containerRef, enabled, origins]);
+    if (!enabled || !container) return;
+    let detach = attachApprovalCards(container, useApprovalOriginsStore.getState().origins);
+    // The list arrives after the first message mounts, and changes with the runtime.
+    const unsubscribe = useApprovalOriginsStore.subscribe((state, previous) => {
+      if (state.origins === previous.origins) return;
+      detach();
+      detach = attachApprovalCards(container, state.origins);
+    });
+    void useApprovalOriginsStore.getState().ensureLoaded();
+    return () => {
+      unsubscribe();
+      detach();
+    };
+  }, [containerRef, enabled]);
 };
 
 const useLinkInteractions = ({

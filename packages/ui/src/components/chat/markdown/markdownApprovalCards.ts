@@ -68,8 +68,9 @@ const heightMessageSchema = z.object({ type: z.literal(HEIGHT_MESSAGE_TYPE), hei
  * message's content changes. Returns the cleanup; cards already drawn stay.
  */
 export const attachApprovalCards = (container: HTMLElement, trustedOrigins: readonly string[]): (() => void) => {
+  if (trustedOrigins.length === 0) return () => {};
   const view = container.ownerDocument.defaultView;
-  if (trustedOrigins.length === 0 || !view) return () => {};
+  if (!view) return () => {};
 
   // Only a card's own window, from a trusted origin, may size its frame.
   const handleMessage = (event: MessageEvent) => {
