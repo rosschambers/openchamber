@@ -265,6 +265,24 @@ finished with `stop`, so no tool patch is parsed while the turn streams.
   Workspace-external images, wherever they are on the machine, receive the
   existing path-bound `outsideFileGrant` only when the server verifies the
   exact source in the owning assistant message and the file's signature.
+- Approval links become approval cards. When the server trusts approval
+  services (`OPENCHAMBER_APPROVAL_ORIGINS`, read once per runtime by
+  `stores/useApprovalOriginsStore.ts` from `/api/openchamber/approval-origins`),
+  `markdown/markdownApprovalCards.ts` replaces a link whose origin is exactly
+  trusted, whose path is `/a/<id>`, and which sits alone in its paragraph with
+  a frame of the service's own card view (`/a/<id>?view=card`). The service
+  draws the card and runs the approval, so the frame delegates
+  `publickey-credentials-get` and nothing else. The frame starts 360px tall;
+  a `{ type: "herald-card-height", height }` message from that frame's own
+  window and a trusted origin sets its height, clamped to 120–900px. Only
+  settled assistant text gets cards (while streaming, each re-render would put
+  the link back and reload the card); a later re-render that restores the link
+  is caught by a `MutationObserver` and gets its card again. With no trusted
+  origins, or on a runtime without the route (an older server, VS Code), links
+  stay links. The frame is built in code: Markdown never produces an iframe,
+  and the sanitizer is unchanged. The service has to allow OpenChamber's
+  origin in its own `frame-ancestors`; the desktop and mobile shells' origins
+  (`openchamber-ui://app`, `capacitor://localhost`) are theirs to add.
 - `read` and `skill` are **static navigation tools** and render via `StaticToolRow`.
 - Every other tool, including search/fetch, OpenCode built-ins, custom tools, plugins, and MCP tools, is **expandable** and renders through `ToolPart`.
 - The managed `openchamber` plugin tool uses the expandable path and hides its broad protocol input. The plugin supplies the selected action's human description as the native tool title; the UI renders that metadata without owning an action map. The full versioned result envelope renders through the same neutral JSON summary/tree/raw views as other tools, without a tool-specific output card.

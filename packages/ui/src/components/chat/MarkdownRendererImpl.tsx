@@ -15,6 +15,7 @@ import { useOpenChatLink } from './useOpenChatLink';
 import { attachFileRefClickGuard, FILE_REFERENCE_LINK_SELECTOR } from './fileRefClickGuard';
 import type { ToolPopupContent } from './message/types';
 import { FadeInOnReveal } from './message/FadeInOnReveal';
+import { useApprovalOriginsStore } from '@/stores/useApprovalOriginsStore';
 import { useUIStore } from '@/stores/useUIStore';
 import { useEffectiveDirectory } from '@/hooks/useEffectiveDirectory';
 import { useRuntimeAPIs } from '@/hooks/useRuntimeAPIs';
@@ -46,6 +47,7 @@ import {
 } from './markdown/decorate';
 import type { RenderedCopyFormat } from './markdown/selectionMarkdown';
 import { attachInlineMarkdownImages } from './markdown/inlineMarkdownImages';
+import { attachApprovalCards } from './markdown/markdownApprovalCards';
 import { attachMarkdownVideoFallback } from './markdown/markdownVideo';
 import { observeMarkdownTableWidth } from './markdown/tableWidthObserver';
 import { findTextPosition } from './markdown/textPosition';
@@ -98,6 +100,20 @@ const useMarkdownVideoFallback = (containerRef: React.RefObject<HTMLDivElement |
     const container = containerRef.current;
     return container ? attachMarkdownVideoFallback(container) : undefined;
   }, [containerRef]);
+};
+
+// Trusted approval links become embedded approval cards
+// (markdown/markdownApprovalCards.ts). Only in settled assistant text: while
+// streaming, each re-render would put the link back and reload the card.
+const useApprovalCards = (containerRef: React.RefObject<HTMLDivElement | null>, enabled: boolean) => {
+  const origins = useApprovalOriginsStore((state) => state.origins);
+  React.useEffect(() => {
+    if (enabled) void useApprovalOriginsStore.getState().ensureLoaded();
+  }, [enabled]);
+  React.useEffect(() => {
+    const container = containerRef.current;
+    return enabled && container ? attachApprovalCards(container, origins) : undefined;
+  }, [containerRef, enabled, origins]);
 };
 
 const useLinkInteractions = ({
@@ -1414,6 +1430,7 @@ const MarkdownRendererImpl: React.FC<MarkdownRendererProps> = ({
   });
   useLinkInteractions({ containerRef, directory: effectiveDirectory });
   useMarkdownVideoFallback(containerRef);
+  useApprovalCards(containerRef, variant === 'assistant' && !isStreaming);
 
   const syntaxVars = React.useMemo(() => getMarkdownSyntaxVars(currentTheme), [currentTheme]);
   // With links opening in the browser panel anyway, the preview button next to
