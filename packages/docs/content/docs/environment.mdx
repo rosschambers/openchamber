@@ -50,6 +50,12 @@ Starts OpenChamber in headless mode when set to `true` or `1`. API routes stay a
 
 Origins allowed to show OpenChamber inside a frame on their own page, separated by spaces, for example `https://dash.example.com`. `*` allows any site. By default only OpenChamber itself and its desktop and mobile apps may frame it, which keeps other sites from overlaying its buttons.
 
+### `OPENCHAMBER_APPROVAL_ORIGINS`
+
+Approval services whose links the chat shows as approval cards, separated by spaces, for example `https://approvals.example`. When an assistant message puts a link such as `https://approvals.example/a/ABC123` on a line of its own, the chat shows that service's own page, `/a/ABC123?view=card`, in its place, and you can approve or cancel without leaving the chat. The card may ask for your passkey. Each entry must be a plain origin: wildcards, paths and other schemes are ignored with a warning in the server log. The default is empty, so links stay plain links.
+
+The service must allow OpenChamber to show it in a frame (`Content-Security-Policy: frame-ancestors` with OpenChamber's address), and it may send `{ type: "herald-card-height", height }` to its parent window to set the card's height.
+
 ### `OPENCHAMBER_DATA_DIR`
 
 Overrides the OpenChamber data directory. The default is `~/.config/openchamber`.

@@ -571,3 +571,15 @@ describe('OpenChamber web update route on Windows', () => {
     expect(logError).toHaveBeenCalledOnce();
   });
 });
+
+describe('OpenChamber approval origins route', () => {
+  it('answers the trusted approval origins from the environment', async () => {
+    const { app } = createApp({ environment: { OPENCHAMBER_APPROVAL_ORIGINS: 'https://approvals.example' } });
+    await request(app).get('/api/openchamber/approval-origins').expect(200, { origins: ['https://approvals.example'] });
+  });
+
+  it('answers no origins when the setting is unset', async () => {
+    const { app } = createApp();
+    await request(app).get('/api/openchamber/approval-origins').expect(200, { origins: [] });
+  });
+});

@@ -1,4 +1,5 @@
 import { publicEnterprisePolicy } from '../enterprise-mode.js';
+import { parseApprovalOrigins } from '../security/request-security.js';
 
 const SYSTEMD_SERVICE_UNIT_PATTERN = /^[A-Za-z0-9:_.@-]+\.service$/;
 
@@ -115,6 +116,13 @@ export const registerOpenChamberRoutes = (app, dependencies) => {
   // Pinned endpoints and keys never leave the server.
   app.get('/api/openchamber/enterprise-policy', (_req, res) => {
     res.json(publicEnterprisePolicy());
+  });
+
+  // Approval services the chat may embed as cards. Read once: the list
+  // changes only with the server's environment.
+  const approvalOrigins = parseApprovalOrigins(process.env?.OPENCHAMBER_APPROVAL_ORIGINS);
+  app.get('/api/openchamber/approval-origins', (_req, res) => {
+    res.json({ origins: approvalOrigins });
   });
 
   app.get('/api/openchamber/update-check', async (req, res) => {

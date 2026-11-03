@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'bun:test';
-import { allowsLocalDevOrigins, buildFrameAncestorsPolicy, createRequestSecurityRuntime, isPasswordlessSocketOriginAllowed } from './request-security.js';
+import { allowsLocalDevOrigins, buildFrameAncestorsPolicy, createRequestSecurityRuntime, isPasswordlessSocketOriginAllowed, parseApprovalOrigins } from './request-security.js';
 
 const createRuntime = () => createRequestSecurityRuntime({
   readSettingsFromDiskMigrated: async () => ({}),
@@ -150,5 +150,33 @@ describe('request security runtime', () => {
     expect(buildFrameAncestorsPolicy({ extra: 'https://dash.example.com, *' })).toMatch(/ https:\/\/dash\.example\.com \*$/);
     // Anything that is not a plain origin stays out of the policy.
     expect(buildFrameAncestorsPolicy({ extra: "https://a.test; script-src 'unsafe-inline'" })).not.toContain('script-src');
+  });
+});
+
+describe('approval origins', () => {
+  const parse = (raw) => {
+    const warnings = [];
+    const origins = parseApprovalOrigins(raw, (message) => warnings.push(message));
+    return { origins, warnings };
+  };
+
+  test('passes a plain origin through', () => {
+    expect(parse('https://approvals.example')).toEqual({ origins: ['https://approvals.example'], warnings: [] });
+  });
+
+  test('is empty when unset or blank', () => {
+    expect(parse(undefined)).toEqual({ origins: [], warnings: [] });
+    expect(parse('  ')).toEqual({ origins: [], warnings: [] });
+  });
+
+  test('ignores entries that are not plain origins, with one warning, and keeps the rest', () => {
+    const { origins, warnings } = parse('https://approvals.example * javascript:alert(1) https://other.example/path http://127.0.0.1:8080');
+    expect(origins).toEqual(['https://approvals.example', 'http://127.0.0.1:8080']);
+    expect(warnings).toHaveLength(1);
+    expect(warnings[0]).toContain('https://other.example/path');
+  });
+
+  test('writes each origin the way a browser reports it, once', () => {
+    expect(parse('HTTPS://Approvals.Example:443 https://approvals.example').origins).toEqual(['https://approvals.example']);
   });
 });

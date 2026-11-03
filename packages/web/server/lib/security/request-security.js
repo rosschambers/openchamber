@@ -41,6 +41,33 @@ export const buildFrameAncestorsPolicy = ({ allowLocalDevOrigins = false, extra 
   return `frame-ancestors ${sources.join(' ')}`;
 };
 
+const APPROVAL_ORIGIN = /^https?:\/\/[a-z0-9.-]+(?::\d{1,5})?$/i;
+
+/**
+ * `OPENCHAMBER_APPROVAL_ORIGINS`: approval services whose links the chat may
+ * draw as embedded approval cards (markdownApprovalCards.ts). Each entry must
+ * be a plain origin; anything else (a wildcard, a path, another scheme) is
+ * left out with one warning, and the rest still apply. Origins are written as
+ * a browser reports them (`MessageEvent.origin`), so the UI compares exactly.
+ */
+export const parseApprovalOrigins = (raw, warn = console.warn) => {
+  const origins = [];
+  const ignored = [];
+  for (const entry of String(raw ?? '').split(/\s+/)) {
+    if (!entry) continue;
+    if (!APPROVAL_ORIGIN.test(entry)) {
+      ignored.push(entry);
+      continue;
+    }
+    const origin = new URL(entry).origin;
+    if (!origins.includes(origin)) origins.push(origin);
+  }
+  if (ignored.length > 0) {
+    warn(`[approval-origins] OPENCHAMBER_APPROVAL_ORIGINS lists entries that are not plain origins, ignored: ${ignored.join(' ')}`);
+  }
+  return origins;
+};
+
 /**
  * With no UI password nothing else stands between a page open in the user's
  * browser and a socket (a terminal among them). A browser always names the
