@@ -1,9 +1,8 @@
 import React from 'react';
 import { getCurrentIntlLocale, useI18n } from '@/lib/i18n';
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip';
-import { useDirectorySync, useSessionMessageRecords, useSyncDirectory, useSyncRuntime } from '@/sync/sync-context';
+import { buildSessionMessageRecordsSnapshot, useDirectoryStore, useDirectorySync, useSessionMessageRecords, useSyncDirectory, useSyncRuntime } from '@/sync/sync-context';
 import { normalizePath } from '@/lib/pathNormalization';
-import { useUIStore } from '@/stores/useUIStore';
 import {
   WorkStatusCollapsibleSection,
   WorkStatusRow,
@@ -15,6 +14,7 @@ import {
   formatTelemetryTokens,
   formatThroughputRate,
   getLatestCompletedTurnStats,
+  getPreviousCompletedTurnStats,
   type CompletedTurnStats,
 } from './telemetry';
 
@@ -25,13 +25,13 @@ type Props = {
 
 /** One hover/focus target covers both the label and its value. */
 const TelemetryRow: React.FC<{ label: string; description: string; value: React.ReactNode }> = ({ label, description, value }) => (
-  <Tooltip delayDuration={750}>
+  <Tooltip delayDuration={300}>
     <TooltipTrigger asChild>
       <div tabIndex={0} className="min-w-0 rounded-md outline-none focus-visible:ring-2 focus-visible:ring-ring">
         <WorkStatusRow label={label} value={value} />
       </div>
     </TooltipTrigger>
-    <TooltipContent side="left" sideOffset={8} className="max-w-[min(320px,calc(100vw-24px))] whitespace-normal break-words text-start">
+    <TooltipContent side="top" sideOffset={4} className="max-w-[min(320px,calc(100vw-24px))] whitespace-normal break-words text-start">
       <p className="font-medium">{label}</p>
       <p>{description}</p>
     </TooltipContent>
@@ -40,11 +40,9 @@ const TelemetryRow: React.FC<{ label: string; description: string; value: React.
 
 export const WorkStatusTelemetrySection: React.FC<Props> = ({ sessionId, directory }) => {
   const { t } = useI18n();
-  const expanded = useUIStore(
-    React.useCallback((state) => state.workStatusExpandedSections['telemetry'] ?? true, []),
-  );
   const { runtimeKey } = useSyncRuntime();
   const syncDirectory = useSyncDirectory();
+  const store = useDirectoryStore(directory ?? undefined);
   const scope = JSON.stringify([runtimeKey, normalizePath(directory ?? syncDirectory), sessionId]);
   const status = useDirectorySync(
     React.useCallback((state) => sessionId
@@ -52,7 +50,8 @@ export const WorkStatusTelemetrySection: React.FC<Props> = ({ sessionId, directo
       : 'unknown', [sessionId]),
     directory ?? undefined,
   );
-  const eligibleForStats = Boolean(sessionId && expanded && status === 'idle');
+  // The collapsed header still needs the latest completed response speed.
+  const eligibleForStats = Boolean(sessionId && status === 'idle');
 
   const records = useSessionMessageRecords(
     sessionId ?? '',
@@ -70,14 +69,24 @@ export const WorkStatusTelemetrySection: React.FC<Props> = ({ sessionId, directo
   React.useEffect(() => {
     if (eligibleForStats) {
       setRetained({ scope, stats: computed });
-    } else {
-      setRetained((previous) => previous?.scope === scope && status !== 'unknown' ? previous : null);
+    } else if (status === 'unknown') {
+      setRetained(null);
+    } else if (retained?.scope !== scope) {
+      // A mid-run mount reads warm history once without subscribing to the stream.
+      const snapshot = buildSessionMessageRecordsSnapshot(store.getState(), sessionId ?? '');
+      setRetained({ scope, stats: getPreviousCompletedTurnStats(snapshot.list) });
     }
-  }, [scope, status, eligibleForStats, computed]);
+  }, [scope, status, eligibleForStats, computed, retained?.scope, store, sessionId]);
   const stats = eligibleForStats ? computed : status !== 'unknown' && retained?.scope === scope ? retained.stats : null;
-  const summary = stats && stats.responseTokensPerSecond !== null
+  const previousTurn = stats !== null && (stats.previousTurn || !eligibleForStats);
+  const rate = stats && stats.responseTokensPerSecond !== null
     ? formatThroughputRate(stats.responseTokensPerSecond)
     : undefined;
+  const summary = previousTurn
+    ? rate !== undefined
+      ? t('chat.workStatus.telemetry.previousTurnRate', { rate })
+      : t('chat.workStatus.telemetry.previousTurn')
+    : rate;
 
   useReportWorkStatusPresence('telemetry', Boolean(sessionId));
 

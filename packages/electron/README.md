@@ -27,6 +27,8 @@ once startup has resolved. The frame colour, window state, splash markup and
 window options live in `early-startup.mjs` so the early window and any later
 main window are built from one definition; both bundles import that module at
 runtime rather than inlining it, or the handoff would see two copies.
+Window state is saved only while the main window is not minimized, so transient
+minimized bounds cannot replace the last normal size or maximized state.
 
 Login-shell environment discovery starts as soon as `main.mjs` runs and
 proceeds asynchronously, so shell startup files run while the window comes up.
@@ -92,7 +94,11 @@ Additional windows keep their own per-window runtime bootstrap instead of being 
 
 The packaged UI protocol rejects relative `/api`, `/auth`, and `/health` requests with JSON `503`; runtime calls must use the per-window HTTP base and never fall back to the app shell.
 
+Extension frames load from `/api/guest-files/<grant>/…`, or `/api/guests/<id>/…` on a server without grants; the desktop navigation guard treats both prefixes as the extension's own pages.
+
 The HTML file preview runs in a sandboxed iframe without `allow-same-origin`, so it has an opaque origin like an extension frame. The desktop navigation guard lets the main app frame load `/api/fs/preview/<grant>/…` into an empty direct child, or reload a preview child with a new grant after the file is saved, and lets the preview follow its own links between pages of the same grant. A preview cannot reach another grant or any other route, and loaded extension frames and their children cannot navigate to a preview.
+
+For a saved host, the guard treats both its `url` and its `apiUrl` as the app's own origin. When a relay host's LAN address changes, the candidate refresh in `packages/ui/src/lib/desktopRelayRestore.ts` rewrites only `apiUrl`, and the window then loads extension pages from that address.
 
 PDF iframes also start with an opaque origin under the packaged UI protocol. The guard lets the main app frame load the HTTP `/api/fs/raw` route into an empty direct child, including under a host path prefix. This does not let loaded extensions, HTML previews, or nested frames navigate to raw files. Isolated-space raw routes are not part of this exception.
 
@@ -105,7 +111,51 @@ opening failures do not fall back to a browser window for application links.
 
 Native menu actions reach the renderer as one DOM event per click. Main must not also send them over IPC: preload turns every IPC emit into a call to its bridge listeners and a DOM event, so the action would run again. Update-check notifications go over IPC only, for the same reason.
 
+Native Copy link uses `context-menu-clipboard.mjs` to write URL text and bookmark
+metadata together through Electron's `ClipboardItem` API. `electron-context-menu`
+4.1.2 still uses the old object-shaped clipboard write. Inside its `prepend` hook,
+`defaultActions.copyLink()` returns the existing item, so replacing that item's
+handler preserves menu order, visibility and live translations. Copy failures are
+logged without clipboard data.
+
+Linux exposes a second clipboard, PRIMARY, that the web Clipboard API cannot
+reach. The local-page preload bridge publishes `clipboard.selection` only on
+Linux, with `readText` and `writeText` for terminal selection and middle-click
+paste. Both commands stay out of `COMMANDS_SAFE_FOR_REMOTE`; remote pages never
+receive the bridge.
+
+`scripts/smoke-context-menu.mjs`, run with Electron on an isolated display and
+clipboard, checks the real dependency's menu identity, translations and native
+clipboard writes. On Linux, run it inside a disposable container with its own Xvfb
+display; it writes synthetic data to that display's clipboard and selection.
+The fixture clicks the built menu item programmatically. A live right-click,
+menu selection and paste in the app still need a separate interaction check.
+
+From the repository root inside that disposable container:
+
+```bash
+xvfb-run -a packages/electron/node_modules/.bin/electron --no-sandbox packages/electron/scripts/smoke-context-menu.mjs
+```
+
 The local diagnostics IPC combines the desktop log with the SSH manager's in-memory history. `main.mjs` classifies SSH messages in the native process before returning them; host names, stderr and other raw SSH output never cross to the renderer. Remote SSH files are not read.
+
+A window whose renderer crashes is reloaded (`renderer-recovery.mjs`). A crash
+counts as one in a row when it comes within two minutes of the previous one.
+The first two in a row reload as they are. The third reloads once in a safe
+start: preload asks main over sync IPC before any page script runs and exposes
+`window.__OPENCHAMBER_SAFE_START__`. The shared UI then forgets expanded
+folders, open files and open panels before the first render, saves that, and
+says so in a toast. A fourth crash in a row leaves the window alone; View >
+Reload is still there. A quiet spell of two minutes starts the count again.
+
+### Why a safe start and not a fixed reload budget
+
+Issue 4907: a restored expanded folder with 28,000 files crashed the window
+about 25 seconds after every load. The earlier budget of three reloads per
+minute never ran out at that pace, and every reload restored the same folder,
+so the window crashed for hours. Counting crashes in a row stops any such
+loop, and dropping the saved layout removes the trigger seen so far. Settings
+and the open chat stay; a crash they cause still stops at the fourth crash.
 
 The compatibility gate can reuse the embedded managed OpenCode CLI preflight
 through `desktop_managed_opencode_compatible`. Main matches the requested
@@ -133,6 +183,7 @@ IPC results if its endpoint changes while the read is pending.
 | `pairing-deep-link.mjs` | Validates an `openchamber://connect` pairing link for the confirmation prompt. After the user confirms, the main window's renderer redeems it (`desktop_take_pending_host_actions`) with the same code as Import Link, so relay-only links pair over the E2EE tunnel. `openchamber://host/<id>` for a host with a relay leg goes through the same queue |
 | `remote-page-policy.mjs` | What remote-safe IPC accepts from and returns to another server's page: splash colour parsing, host list without credentials |
 | `shell-environment.mjs` | Asynchronous login-shell environment discovery and shared one-shot probe |
+| `windows-app-discovery.mjs` | Windows "Open in": which apps are installed, their icons, and launch candidates. Every `where.exe` and PowerShell lookup is awaited, because a synchronous spawn per candidate froze the window for the whole scan |
 | `preload.mjs` | Safe bridge from the rendered UI to Electron IPC |
 | `ssh-manager.mjs` | SSH host import, connection lifecycle, tunnel/port forwarding helpers |
 | `startup-ssh.mjs` | Opening the default SSH instance's tunnel during startup, bounded, with teardown so a failed attempt boots Local (`sshStartupFallbackHostId` in the boot outcome) |
@@ -146,8 +197,9 @@ IPC results if its endpoint changes while the read is pending.
 | `scripts/opencode-cli-version.mjs` | Reads the pinned OpenCode CLI version and parses `opencode --version` output |
 | `scripts/bundle-main.mjs` | Bundles Electron main code into `dist-bundle/{entry,main,early-startup}.mjs` for packaging |
 | `scripts/rebuild-native.mjs` | Rebuilds native modules against the Electron runtime |
-| `scripts/package.mjs` | Runs `electron-builder`, with unsigned Windows builds when signing env is missing |
-| `resources/` | Packaged web assets, icons, and macOS entitlements |
+| `scripts/package.mjs` | Runs `electron-builder`, with unsigned Windows builds when signing env is missing. With `OPENCHAMBER_DESKTOP_CHANNEL=canary` it passes the configuration from `scripts/canary-build-config.mjs`, which swaps in the Canary icons |
+| `scripts/windows-signpath.mjs` | Two-pass Windows build for SignPath signing, and the electron-builder sign hook it uses (see *Windows signing through SignPath*) |
+| `resources/` | Packaged web assets, icons, macOS entitlements, and the NSIS include for the Windows installer. Every file in `resources/icons` is written by `bun run brand:generate` (`scripts/brand`); do not edit them by hand. `resources/icons-canary` holds Canary's: its `AppIcon.icon` is hand-made, the rest is generated from it |
 
 ## Development
 
@@ -196,7 +248,7 @@ bun install
 bun run electron:dev
 ```
 
-`bun run electron:dev` starts the web dev server with HMR, then launches Electron against `packages/electron/entry.mjs`. On Windows, the HMR launcher resolves npm's `bun.cmd` shim to the underlying `bun.exe` before spawning Bun child processes.
+`bun run electron:dev` starts the web dev server with HMR, then launches Electron against `packages/electron/entry.mjs`. An in-app restart under this script skips `app.relaunch()`: Electron exits with the code the script passes in `OPENCHAMBER_ELECTRON_DEV_RELAUNCH_EXIT_CODE`, and the script starts Electron again while the HMR server keeps running. On Windows, the HMR launcher resolves npm's `bun.cmd` shim to the underlying `bun.exe` before spawning Bun child processes.
 
 The Electron workspace package trusts Electron's install script so `bun install` downloads the platform runtime in fresh checkouts and worktrees.
 
@@ -237,19 +289,49 @@ That runs, in order:
 3. `prepare:ripgrep` to download/cache the target architecture's ripgrep and copy it into `packages/electron/resources/ripgrep`.
 4. `bundle:main` to create `packages/electron/dist-bundle/{entry,main,early-startup}.mjs`.
 5. `rebuild:native` to rebuild native modules for Electron.
-6. `package.mjs` to run `electron-builder`; its `afterPack` hook stages the compiled macOS icon asset catalog.
+6. `package.mjs` to run `electron-builder`; its `afterPack` hook stages the compiled macOS icon asset catalog and gives the macOS main executable its own UUID.
 
 Build output goes to `packages/electron/dist`.
 
 Electron Builder copies the `@openchamber/web` workspace package whole, ignoring its `files` field, so `build.files` in `package.json` excludes what the packaged runtime never loads: the web package's `dist` (packaged builds serve `Resources/web-dist` through `OPENCHAMBER_DIST_DIR`), its `src`, configs, tests and stray tarballs; TypeScript sources, source maps and Markdown other than licenses from every dependency; `bun-pty`, which only the Bun runtime imports; luxon builds other than `build/node` (CommonJS, for cron-parser) and `build/es6` (ESM, for the server); and `node-pty` prebuilds other than `${platform}-${arch}` (the Electron-rebuilt `build/Release` binary loads first; `${platform}` is the build host, which matches the target because `rebuild:native` already builds for the host OS). Keep these exclusions in the top-level `files`: Electron Builder treats a platform-level `files` list as its own file set, and one holding only exclusions copies the whole package directory into the archive. The `afterPack` hook then reads the `app.asar` header (`scripts/packaged-app-contents.cjs`) and fails the build when anything outside `node_modules` other than the bundled main files, `preload.mjs` and `package.json` is packed, when the web `dist` is packed, or when the bundled main files, the web server entry and manifest, or the unpacked git helpers are missing.
 
+Windows voice-model installation uses the native decoder from `7zip-bin`, a runtime dependency of the web backend. Its executable stays in `app.asar.unpacked` so the server can spawn it directly with a hidden window. Windows packaging keeps only the target decoder architecture; macOS and Linux packaging exclude all decoder binaries. The `afterPack` check requires the target Windows decoder in both the ASAR header and the unpacked directory, including ARM64 builds on x64 hosts. Extraction and staging remain owned by the [dictation module](../web/server/lib/dictation/DOCUMENTATION.md).
+
 macOS builds produce `dmg` and `zip` artifacts. Windows builds produce an NSIS installer. Linux builds produce an AppImage, a `.deb` and an `.rpm` for the native x64 or arm64 host; the `.rpm` needs `rpmbuild` on the build host.
+
+### Why the macOS executable gets its own UUID
+
+macOS Local Network privacy identifies an app by its main executable's Mach-O `LC_UUID` (Apple TN3179). Electron ships one prebuilt executable per version and architecture, so every app on the same Electron release shares that UUID, and macOS applies the Local Network answer of whichever of those apps it met first. OpenChamber then never gets its own prompt: its terminals and the managed OpenCode get `No route to host` for LAN addresses when the other app was denied or never asked, and the prompt, when one shows, names the other app. The `afterPack` hook (`scripts/macos-executable-uuid.cjs`) writes a UUID derived from the `appId` before electron-builder signs, so it stays the same across releases and the user's answer survives updates; the first update to such a build asks once. The hook then signs the executable ad hoc, so a build that skips signing still launches on arm64. Only the small launcher changes; `Electron Framework.framework` and the helper apps keep Electron's binaries. A thin executable is required, so a `--universal` build fails here.
+
+Making terminals and OpenCode their own responsible process (a private `responsibility_spawnattrs_setdisclaim` launcher) also gets them LAN access, but it moves every other privacy prompt they raise, such as Documents or Desktop, away from OpenChamber. With the UUID fix they stay attributed to OpenChamber.
+
+### Windows signing through SignPath
+
+`.github/workflows/windows-signed-build.yml` builds and signs the Windows app; the signing policy, organization and project are the `env` block at its top. Two workflows call it: the desktop smoke workflow (`sign_windows` input) and `release-windows.yml`, run from a release tag. Releases still come unsigned from `release.yml` until the SignPath Foundation certificate is issued; then `release.yml` stops building Windows and publishing, and `release-windows.yml` adds the signed files to the draft and publishes it. `scripts/windows-signpath.mjs` drives the build in two passes, each followed by one signing request that holds both architectures, so a build needs two approvals in SignPath:
+
+1. `build-app` builds the app and stages `OpenChamber.exe` and the NSIS uninstaller. The request uses the `windows-app` artifact configuration.
+2. `build-installer` puts the signed `OpenChamber.exe` into the same unpacked app and builds the installer from it (`--prepackaged`), with the signed uninstaller in place. The request uses `windows-installer`.
+3. `finalize` regenerates the blockmap and `latest.yml`, which electron-builder computed from the unsigned installer.
+
+Only those executables are ours. Electron's DLLs, `elevate.exe`, the bundled OpenCode CLI, ripgrep and node-pty's binaries come from upstream projects, and SignPath Foundation's terms forbid signing them with our certificate; they ship unsigned inside the signed installer.
+
+#### Why Windows releases get their own workflow
+
+SignPath refuses a signing request from a run where any job ran on a runner other than GitHub-hosted, including jobs that never touched the Windows files. `release.yml` runs npm, macOS and Linux on Blacksmith runners, so signing inside it fails. `release-windows.yml` builds and signs in a run of its own. Re-signing the installers `release.yml` built is ruled out: SignPath vouches that a file was built from the source in the run that asks for the signature.
+
+#### Why the second pass reuses the unpacked app instead of building again
+
+`OpenChamber.exe` carries the hash of `app.asar` in its resources. A fresh pack writes a new `app.asar`, and the signed executable from the first pass would no longer match it.
+
+#### Why the uninstaller is swapped in a sign hook
+
+electron-builder compiles the uninstaller and embeds it in the installer within one NSIS step, and SignPath signs only files a workflow step uploads. The `win.signtoolOptions.sign` hook is the one point between those two: in the first pass it copies the uninstaller out, in the second it replaces the freshly compiled uninstaller with the signed copy. Both come from the same NSIS script and version.
 
 ## Platform Notes
 
 macOS packaging needs Xcode/build tools for notarized builds and icon asset compilation.
 
-Windows packaging needs NSIS support through `electron-builder`. If no Windows signing env is set, `package.mjs` disables code signing and builds an unsigned installer. Windows updates use `latest.yml` for x64 and the `latest-arm64.yml` channel for ARM64 so each installation resolves an architecture-matching installer.
+Windows packaging needs NSIS support through `electron-builder`. If no Windows signing env is set, `package.mjs` disables code signing and builds an unsigned installer. `build.nsis.include` adds `resources/installer.nsh`, which declares the installer and uninstaller DPI-aware; without it Windows scales their windows as a bitmap and they look blurred at a display scale above 100% (#5010). Windows updates use `latest.yml` for x64 and the `latest-arm64.yml` channel for ARM64 so each installation resolves an architecture-matching installer.
 
 Linux packages must be built natively. Set `OPENCHAMBER_TARGET_ARCH=x64` or `OPENCHAMBER_TARGET_ARCH=arm64` when packaging; the build rejects a target that does not match the Linux host. The same target selects the bundled OpenCode CLI, native Electron rebuild, and Electron Builder architecture. Linux identity is stable across architectures: executable `openchamber`, desktop file `openchamber.desktop`, icon `openchamber`, and `StartupWMClass=openchamber`.
 
@@ -275,11 +357,24 @@ Linux updates are supported when the packaged app runs from a writable AppImage 
 
 ### Updater End-to-End Fixture
 
+Updater checks preserve downloaded payloads for the same version. Feed errors
+preserve an existing pending record; a missing feed with no pending record
+keeps the first-release "no update" behavior. An authoritative no-update
+response clears the record. Downloads for the same version share one process-wide
+promise until the payload is on disk, including cached downloads without an event.
+A request for another version fails as busy until that promise settles. Both the
+download event and promise completion mark readiness only for their own version,
+so an intervening check for a newer release cannot attach the old installer to it.
+
 A loopback-only updater fixture is available for contributor QA of N-to-N+1 AppImage replacement and restart behavior. It is test infrastructure, not a user-configurable update source. See [`scripts/updater-e2e-fixture.md`](./scripts/updater-e2e-fixture.md) for the controlled test procedure. Unit tests cover feed selection, check failures, no-update results, and fixture generation; actual AppImage replacement and restart remains a manual native N-to-N+1 release boundary because it requires executing two packaged versions on each supported architecture.
 
 The package supports macOS, Windows, and Linux desktop features. Linux builds include in-app window controls, auto-update, system tray (right-click Show / Hide / Close), and launch-at-login (XDG autostart). Opening files in installed apps, installed-app discovery, and FreeDesktop icon lookup (including the default file manager) work on macOS, Windows, and Linux.
 
 On Windows and Linux, the General setting persisted as `desktopMinimizeToTrayEnabled` keeps the app running in the tray when the main window is **closed**. Minimize — the in-app control, the native title-bar button, and the taskbar — always performs a normal window minimize, so the taskbar entry stays available.
+
+Every path that hides a window instead of closing it goes through `hideWindow` (`window-hide.mjs`). On macOS a native full-screen window leaves full screen before hiding so its empty Space does not leave the display black. Hide and toggle shortcuts restore full screen when shown again; closing returns a normal window. Explicit show paths use `showWindow` to cancel pending hiding before showing or focusing, even while the window is still visible during the native transition. A repeated hide shares the pending transition, and closing discards its full-screen restoration. Windows and Linux hide in place.
+
+An exit requested during entry remains queued in Electron even after an explicit show. The hide helper keeps its exit listener until that exit completes so Hide can restore full screen. Early entry remains a known gap: Electron exposes no public entry-start event or transition-state getter, and `isFullScreen()` can still report false while entry is pending, allowing an immediate hide before entry completes.
 
 The macOS menu bar item is enabled by default and can be disabled in General settings. The setting applies after restart. While disabled, Desktop skips the native tray controller, tray-specific subscriptions, polling, and quota refresh. Dock badges remain independent: unread activity, session membership, and badge preferences still update the Dock through the shared IPC command. Turning off the Dock badge clears its count without enabling the menu bar item.
 
@@ -311,7 +406,7 @@ The server (`packages/web/server/lib/fs/ripgrep.js`) looks for ripgrep in this o
 |----------|-----|
 | `OPENCHAMBER_ELECTRON_DEV=1` | Marks the runtime as desktop development mode |
 | `OPENCHAMBER_ELECTRON_USE_BUNDLED_UI=1` | Uses staged web assets instead of the HMR dev server |
-| `OPENCHAMBER_SKIP_LOCAL_SERVER=1` | Skips the in-process local OpenChamber server and uses the configured default remote instance; Desktop imports this from the user's login-shell environment, and packaged/bundled UI remains available for connection recovery. The host switcher then lists no Local entry |
+| `OPENCHAMBER_SKIP_LOCAL_SERVER=1` | Skips the in-process local OpenChamber server and uses the configured default remote instance; Desktop imports this from the user's login-shell environment, and packaged/bundled UI remains available for connection recovery. The host switcher then lists no Local entry and names the window's address as the current instance. Every start that skips the server, or opens `OPENCHAMBER_SERVER_URL`, says so in `main.log`, because a launcher that inherits these variables leaves no other trace |
 | `OPENCHAMBER_HMR_UI_PORT` | Preferred Vite UI port for desktop dev, default `5173` |
 | `OPENCHAMBER_HMR_API_PORT` | Preferred API port for desktop dev, default `3901` |
 | `OPENCHAMBER_ELECTRON_REMOTE_DEBUGGING_PORT` | Development only: opens Chromium's DevTools protocol on this loopback port so a debugger can attach to the dev window; ignored in packaged builds |
@@ -350,7 +445,14 @@ The server (`packages/web/server/lib/fs/ripgrep.js`) looks for ripgrep in this o
   while terminal and file-editor focus adjust their own font sizes.
 - New Mini Chat windows default to the managed Chats target. Explicit project/worktree drafts retain their target, existing managed chat sessions reopen in their own directory, and the compact header omits project/branch metadata for Chats. Opening a managed draft back in the main window preserves that target.
 - Multiple native windows.
-- Native notifications.
+- Native notifications. On macOS, viewing a session (the UI's
+  `markSessionViewed`: opening it, or returning to the window while it is
+  open) removes that session's delivered notifications from Notification
+  Center through `desktop_clear_session_notifications`. Main removes only
+  notifications it delivered in the current run. A click opens the session
+  in the window that shows its instance and raises that window; the
+  receiving window is brought forward first only when it already shows the
+  same instance, so the local window does not jump in front of a remote one.
 - User-confirmed local folder selection. The shared UI supplies the requested directory as the picker `defaultPath`; confirmation is required before filesystem access is retried.
 - Theme-file selection uses the local `~/.vscode/extensions` directory when present.
   The local-page-gated `desktop_pick_theme_file` command returns only the selected
@@ -359,11 +461,11 @@ The server (`packages/web/server/lib/fs/ripgrep.js`) looks for ripgrep in this o
 - One-click open/reveal/open-in-app actions.
 - Desktop host switcher and deep-link imports.
 - Local and remote instance handling. The switcher lists Local only with the origin main reports for the local server, never with the page's own origin. A window can show another instance's own page, for example after a connect link redirects to that server. Such a page cannot switch to Local in place, because the local server answers only the app's own origins and the local token stays with local pages. The switcher asks main through the remote-safe `desktop_switch_to_local`, and main loads the Local UI into the main window the way `openchamber://host/local` does. The command acts only for the main window, because other windows keep the runtime they were opened with. Everywhere else it returns false and the switcher switches in place.
-- Which instance a new window opens on. The main window and the menu New Window open the default instance: on launch the renderer reconnects a relay-capable default host (`restoreDesktopRelayRuntime` with no target). A window opened for a specific instance (the switcher's "Open in new window", a host deep link, Mini Chat) is marked with `--openchamber-explicit-runtime` and keeps that instance. A direct instance arrives as an injected endpoint and skips the restore; a relay-capable one arrives as `--openchamber-relay-host-id`, and the renderer connects it with `reconnectActive`, because boot already set that host's runtime key and a plain restore would treat the window as connected. Mini Chat passes the parent's runtime key, so main resolves a relay-capable parent to its host id.
+- Which instance a new window opens on. The main window and the menu New Window open the default instance: on launch the renderer reconnects a relay-capable default host (`restoreDesktopRelayRuntime` with no target). A window opened for a specific instance (the switcher's "Open in new window", a host deep link, Mini Chat) is marked with `--openchamber-explicit-runtime` and keeps that instance. A direct instance arrives as an injected endpoint and skips the restore; a relay-capable one arrives as `--openchamber-relay-host-id`, and the renderer connects it with `reconnectActive`, because boot already set that host's runtime key and a plain restore would treat the window as connected. Mini Chat passes the parent's runtime key, so main resolves a relay-capable parent to its host id. Windows opened for a configured host carry the host's id as a tag (`__ocHostWindowId`), and the renderer reports its live runtime key to main at boot and on every switch (`desktop_set_window_runtime_key`), so `openHostWindow` finds the window to reuse by the live key first and the tag second: a link or notification click for a host that is already open lands in that window instead of opening another.
 - SSH host import, connections, logs, and port forwarding.
 - SSH uses OpenSSH ControlMaster on macOS/Linux. Windows uses independent hidden OpenSSH processes for setup commands and each long-lived forward because Win32 OpenSSH does not support ControlMaster reliably.
 - With ControlMaster, every forward, the main one included, is added with `ssh -O forward`: the master holds the listener, and that command's exit status is the answer. A `-N -L` client through the master would open a remote login shell and exit with that shell's status, which says nothing about the forward. The connection monitor then watches the local port and the master.
-- A managed SSH instance runs one server per remote host. The server outlives the SSH session by default (`keepRunning`), so every connect first asks the remote CLI (`openchamber status --json`) what is already running and reuses a server that fits the instance's password. `/api/system/info` is public, so an answer proves nothing about the password: the server has to accept it on `/auth/session`, or have none when the instance has none. Among the servers that fit, a CLI-started daemon of another app version, or one whose bind address no longer matches the instance's network setting, is stopped and replaced. A registered server that is passed over gets a line in the connect log saying why. Foreground servers and servers with another password are neither reused nor stopped. With `keepRunning` off, disconnecting stops an adopted daemon the same way it stops one this session started. The server is shared by every client that fits it, so that stop also ends it for any other client still connected. Starting a server without this lookup leaks one server plus its opencode per reconnect.
+- A managed SSH instance runs one server per remote host. The server outlives the SSH session by default (`keepRunning`), so every connect first asks the remote CLI (`openchamber status --json`) what is already running and reuses a server that fits the instance's password. `/api/system/info` is public, so an answer proves nothing about the password: the server has to accept it on `/auth/session`, or have none when the instance has none. An instance without a password starts servers with the `OPENCHAMBER_UI_PASSWORD` the remote login shell sets, so a protected server is checked against that one; the probe pipes it to curl on the remote, so the desktop never asks for it and it stays out of command lines. Among the servers that fit, a CLI-started daemon of another app version, or one whose bind address no longer matches the instance's network setting, is stopped and replaced. A registered server that is passed over gets a line in the connect log saying why. Foreground servers and servers with another password are neither reused nor stopped. With `keepRunning` off, disconnecting stops an adopted daemon the same way it stops one this session started. The server is shared by every client that fits it, so that stop also ends it for any other client still connected. Starting a server without this lookup leaks one server plus its opencode per reconnect.
 - Tunnel lifecycle integration through the web server runtime.
 - Remote dev-server previews use a direct WebSocket tunnel when the instance has an HTTP address. Relay-only instances keep the encrypted relay transport in the renderer and bridge its raw bytes to the browser panel through a local Electron listener.
 - Auto-update checks, downloads, and restart/apply flow.
@@ -379,7 +481,24 @@ The server (`packages/web/server/lib/fs/ripgrep.js`) looks for ripgrep in this o
   session too, so icons behind the page's own login resolve and the app's origin
   never requests anything from a third-party host. Self-signed loopback HTTPS
   pages may use an untrusted certificate authority; certificate failures for
-  external hosts and all other certificate errors remain blocked.
+  external hosts and all other certificate errors remain blocked. Its cookies
+  and storage are flushed to disk before quitting, because `app.exit()` skips
+  Chromium's own shutdown write and a fresh sign-in would be lost. Electron
+  drops session cookies (no expiry) on quit, and many sign-ins live in one, so
+  before quitting they are rewritten with an expiry (`browser-panel-cookies.mjs`),
+  as Chrome keeps them when it continues where you left off.
+- `window.open` from a page in that session (`browserPanelWindowOpenTarget`): a
+  scripted popup opens as a sandboxed child window of the app window, keeping
+  `window.opener`, so a Google, GitHub or SSO sign-in can post its result back;
+  the popup itself may open nothing further. Chromium reports `window.open(url)`
+  without window features as a new tab, the same as a target=_blank link, so the
+  session's preload (`browser-panel-preload.cjs`, exposes nothing) marks every
+  `window.open` that keeps its opener as a popup. A link aimed at a new tab is
+  noopener by default and becomes a panel tab
+  (`openchamber:browser-panel-open-tab` to the renderer). Pages of an
+  isolated space keep everything in place, so nothing leaves the space's session.
+  Popups close with the window that opened them and do not count as app windows
+  when closing the last one hides the app on macOS.
 
 ## IPC Pattern
 
@@ -391,6 +510,29 @@ Add new native capabilities in this order:
 2. Add the real command handling in `main.mjs` under `openchamber:invoke`.
 3. Gate privileged commands in main process logic so remote pages cannot access local filesystem or shell capabilities. A command added to `COMMANDS_SAFE_FOR_REMOTE` takes input from, and answers, another server's page: parse what it stores and strip credentials from what it returns (`remote-page-policy.mjs`). Splash colours, for example, end up in the trusted splash page, and `desktop_hosts_get` hands remote pages the host list without tokens or auth headers.
 4. Keep shared UI runtime contracts in `packages/ui` and server/runtime APIs in `packages/web` when the behavior is not inherently native.
+
+## Update channels and Canary
+
+The desktop app updates from one of two channels, chosen under Settings → About → Updates and stored as `desktopUpdateChannel` in `settings.json`:
+
+- **Stable**: the latest full release on GitHub (the `github` provider of electron-updater).
+- **Canary**: the nightly build of `main`. `.github/workflows/canary.yml` builds it when `main` moved and replaces the files of one pre-release tagged `canary`; the app reads that pre-release's manifests directly (the `generic` provider on `releases/download/canary/`). Stable never sees them, because the GitHub provider reads only the latest full release.
+
+Picking Canary checks at once and offers the Canary build as an ordinary update; after it installs, the app is Canary and keeps updating from Canary. Picking Stable from a Canary build offers the latest release, which is older: `applyUpdaterChannel` (`main.mjs`) sets `allowDowngrade` for exactly that case, and `updater-check.mjs` takes electron-updater's verdict instead of comparing versions itself. A release build never downgrades. On a Linux .deb or .rpm install the downgrade tells the package manager the older package is wanted (`linux-package-install.mjs`), or it would keep the newer one. Every check re-reads the stored channel, so a switch needs no restart; a switch during a running check waits for that check first, because electron-updater answers a running check for the feed it started on.
+
+A Canary build is the release app with other icons: same name, bundle id, install location, profile and `openchamber://` registration, so an update replaces one with the other in place. `OPENCHAMBER_DESKTOP_CHANNEL=canary` while packaging makes `scripts/package.mjs` apply `scripts/canary-build-config.mjs`, which only swaps `resources/icons` for `resources/icons-canary` (Dock and taskbar icon, menu bar and tray glyphs). Its version is the release it leads to with a `canary` pre-release part, `2.5.4-canary.20261030.123` on a `main` at 2.5.3: above the latest release, so Stable installs update into it, and below the next one; the workflow sets it in every workspace. A remote host reached over SSH gets the same Canary version from npm, like a release build installs its own: the workflow publishes the GitHub pre-release only after `@openchamber/web` reached npm, so every Canary desktop build has its version there.
+
+### Why a channel switch and not a separate Canary app
+
+A separate app (own name, id, profile) was built first. It meant two installs, two Dock icons and two sets of windows for one set of data, and most of the identity code existed only to keep them apart. One app that moves between channels is what people know from browsers' release channels, and going back is one update.
+
+### Why Stable after Canary downgrades at once and not at the next release
+
+Waiting for the next release would leave the person on a build they asked to leave for up to a few days. The downgrade is offered right away, knowing that a Canary build may have written settings or data in a form the older release does not read yet.
+
+### Why one rolling pre-release and not a release per night
+
+The download link stays the same, the releases page does not fill up with nightly entries, and the update feed is one fixed address.
 
 ## Logs And Data
 

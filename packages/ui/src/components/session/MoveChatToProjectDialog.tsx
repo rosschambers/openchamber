@@ -5,7 +5,9 @@ import { Icon } from '@/components/icon/Icon';
 import { useI18n } from '@/lib/i18n';
 import { formatDirectoryName, formatPathForDisplay } from '@/lib/utils';
 import { useProjectsStore } from '@/stores/useProjectsStore';
+import { useProjectsInSidebarOrder } from '@/components/session/sidebar/list/useProjectsInSidebarOrder';
 import { useDirectoryStore } from '@/stores/useDirectoryStore';
+import { ScrollableOverlay } from '@/components/ui/ScrollableOverlay';
 
 /**
  * Picks the project a chat moves into. The conversation goes to the project's
@@ -18,7 +20,7 @@ export const MoveChatToProjectDialog: React.FC<{
   onPick: (projectDirectory: string) => void;
 }> = ({ open, onOpenChange, onPick }) => {
   const { t } = useI18n();
-  const projects = useProjectsStore((state) => state.projects);
+  const projects = useProjectsInSidebarOrder(useProjectsStore((state) => state.projects), open);
   const homeDirectory = useDirectoryStore((state) => state.homeDirectory);
 
   return (
@@ -28,7 +30,7 @@ export const MoveChatToProjectDialog: React.FC<{
           <DialogTitle>{t('sessions.moveChatToProject.title')}</DialogTitle>
           <DialogDescription>{t('sessions.moveChatToProject.description')}</DialogDescription>
         </DialogHeader>
-        <div className="flex max-h-[50vh] flex-col gap-0.5 overflow-y-auto">
+        <ScrollableOverlay outerClassName="max-h-[50vh]" className="flex flex-col gap-0.5" disableHorizontal>
           {projects.map((project) => (
             <button
               key={project.id}
@@ -48,7 +50,7 @@ export const MoveChatToProjectDialog: React.FC<{
               </span>
             </button>
           ))}
-        </div>
+        </ScrollableOverlay>
       </DialogContent>
     </Dialog>
   );

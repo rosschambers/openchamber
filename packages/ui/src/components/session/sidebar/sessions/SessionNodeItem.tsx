@@ -1,7 +1,10 @@
 import { DirectoryActionIndicator } from './DirectoryActionIndicator';
+import { formatShortcutForDisplay, getEffectiveShortcutCombo } from '@/lib/shortcuts';
 import { useSessionTurnActivity } from '@/sync/global-session-status';
 import { getSessionActivityTime } from '@/sync/session-ordering';
 import React from 'react';
+import { TooltipLabelWithShortcut } from '@/components/ui/action-toolbar';
+import { leaveFinishedSessions } from '@/lib/sessionTabs';
 import { SessionActivityIndicator } from '@/components/session/SessionActivityIndicator';
 import type { Session } from '@/lib/opencode/model';
 import { ContextMenu } from '@base-ui/react/context-menu';
@@ -18,14 +21,15 @@ import {
 } from '@/components/ui/dropdown-menu';
 import { dropdownMenuItemClass, dropdownMenuPopupClass, dropdownMenuSeparatorClass, dropdownMenuSubTriggerClass } from '@/components/ui/dropdown-menu.styles';
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '@/components/ui/tooltip';
-import { getPrStatusLabel } from '../prStatusLabel';
 import { cn, formatDirectoryName } from '@/lib/utils';
 import { canUseElectronDesktopIPC, getMiniChatRuntimeArgs, invokeDesktop, isVSCodeRuntime } from '@/lib/desktop';
 import { toast } from '@/components/ui';
 import { Button } from '@/components/ui/button';
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from '@/components/ui/dialog';
-import { isSessionPinned } from '@/lib/sessionPins';
-import { toggleSessionPin } from '@/sync/session-pins';
+import { getSessionPinList, isSessionPinned } from '@/lib/sessionPins';
+import { setSessionPinList } from '@/sync/session-pins';
+import { PinToMenu } from '../sections/PinToMenu';
+import { DEFAULT_PIN_LIST } from '@/lib/sidebarSections';
 import { Icon } from "@/components/icon/Icon";
 import { buildExportFilename, downloadAsMarkdown, formatSessionAsMarkdown, getExportRevealLabelKey, revealExportedMarkdown, saveAsMarkdownDesktop } from '@/lib/exportSession';
 import type { ChildSessionExport } from '@/lib/exportSession';
@@ -43,38 +47,38 @@ import { getSyncSessionMaterializationStatus } from '@/sync/sync-refs';
 import { useViewportStore, viewportSessionKey } from '@/sync/viewport-store';
 import { DraggableSessionRow } from '../folders/sessionFolderDnd';
 import { useSessionRowOrderRegistry } from './sessionRowOrder';
-import { canShowSessionWorktreeMenu, getSessionWorktreeMenuDisabled, nodeContainsSessionId, nodeHasPinnedMembershipChange, resolveSessionPrLookup, resolveTooltipBranchLabel, selectBlockingBadgeSessionScopes, type BlockingBadgeSessionScope } from './sessionNodeItemUtils';
+import { canShowSessionWorktreeMenu, getSessionWorktreeMenuDisabled, nodeContainsSessionId, nodeHasPinnedMembershipChange, resolveTooltipBranchLabel, selectBlockingBadgeSessionScopes, type BlockingBadgeSessionScope } from './sessionNodeItemUtils';
 import { useSessionRowMenuState } from './useSessionRowMenuState';
 import { buildActiveSessionTreeFromCache, collectSessionMoveDescendants } from './sessionSubtreeActions';
 import type { SessionNode } from '../types';
-import { hasTreeSlotContext, isTwoLineTimelineContext, type SessionSidebarRenderContext } from '../sessionSidebarRowModel';
+import { listedChildren } from '../listedChildren';
+import { isMultiLineTimelineContext, sessionExpansionKey, type SessionSidebarRenderContext } from '../sessionSidebarRowModel';
 import { SessionTimelineRowBody } from './SessionTimelineRowBody';
-import { sessionTreeRowPaddingLeft } from './sessionTreeGeometry';
+import { sessionDetailedRowPaddingLeft, sessionTreeRowPaddingLeft } from './sessionTreeGeometry';
 import { FileTreeChevron } from '@/components/views/files/FileTreeRowParts';
 import { formatProjectLabel, formatSessionCompactDateLabel, formatSessionDateLabel, normalizePath, renderHighlightedText } from '../utils';
 import { useProjectsStore } from '@/stores/useProjectsStore';
 import { useOpenTrackerItem } from '@/components/sourceBoard/openTrackerItem';
 import { RowMarkTooltip } from './RowMarkTooltip';
 import { SessionMenuItemHint } from '../../SessionMenuItemHint';
-import { SIDEBAR_REF_TOOLTIP_CLOSE_DELAY_MS, SidebarRefLinks, type SidebarRefLink } from './SidebarRefLinks';
+import { SIDEBAR_REF_TOOLTIP_CLOSE_DELAY_MS, SidebarRefLinks } from './SidebarRefLinks';
 import { useScrollDismissedTooltip } from './useScrollDismissedTooltip';
-import { useFreshestSourceControlVisualSummaryForBranch, type PrVisualSummary } from '@/stores/useGitHubPrStatusStore';
-import { useTrackedIssueStates, useTrackedLinearStates, useTrackedPullVisualSummaries } from '@/stores/useTrackedItemsStore';
-import { githubThread, gitlabThread, linearIssue } from '@/lib/trackedItems/fromLinks';
-import { formatChangeRequestReference } from '@/lib/source-control/identity';
 import { refTintStyle } from '@/lib/source-control/prVisualState';
-import { getLinkedGitHubPullRequests, getLinkedSidebarChanges, getLinkedSidebarIssues, type LinkedGitHubPullRequest, type LinkedSidebarChange, type LinkedSidebarIssue } from '@/lib/linkedIssues';
-import { buildSessionIssueItems, combineSessionPrSummaries, findLinkedPrsWithoutState } from './sessionPrSummaries';
-import { useSessionUnseenCount } from '@/sync/notification-store';
-import { useHasSessionActivityDuration } from '@/sync/session-activity-timing';
+import { useSessionRefLines } from './useSessionRefLines';
+import { useSessionUnread } from '@/sync/session-unread';
+import { useHasSessionTurnDuration } from '@/sync/session-turn-duration';
 import { SessionActivityDuration } from '@/components/session/SessionActivityDuration';
 import { useSessionMultiSelectStore } from '@/stores/useSessionMultiSelectStore';
 import { useI18n } from '@/lib/i18n';
 import { useShiftKeyHeld } from '@/hooks/useShiftKeyHeld';
 import { getSessionGoal } from '@/lib/sessionGoalMetadata';
 import { getCurrentSessionAssist } from '@/lib/sessionAssistMetadata';
-import { isDoneSuggested, isSessionInWork } from '@/lib/sessionWorkMetadata';
+import { isDoneSuggested } from '@/lib/sessionWorkMetadata';
+import { collectSessionWorkInWork } from '../works/sidebarWorks';
+import { isRowBoxClick } from './rowBoxClick';
 import { setSessionWorkState } from '@/sync/session-actions';
+import { useSessionWarmingStore, useSessionWarmUntil } from '@/stores/useSessionWarmingStore';
+import { isSpaceDirectory } from '@/lib/spaces/space-route';
 import { sessionGoalStatusColor, sessionGoalStatusLabelKey } from '@/lib/sessionGoalPresentation';
 import { getChatsRootFromDirectory, isChatDirectoryPath } from '@/lib/chatDirectories';
 import { getMultiRunIdentity, sameMultiRunIdentity } from '@/lib/multirun/identity';
@@ -108,16 +112,18 @@ type SecondaryMeta = {
 export type SessionNodeItemProps = {
   node: SessionNode;
   depth?: number;
+  /** The row is a work of its own; a row inside one leaves Track / Done to it. */
+  ownsWork: boolean;
   groupDirectory?: string | null;
   projectId?: string | null;
   folderOwnerKey?: string | null;
+  ownerProjectId?: string | null;
   selectionScopeKey?: string | null;
   archivedBucket?: boolean;
   pinnedSessionIds: Set<string>;
   expandedParents: Set<string>;
   hasSessionSearchQuery: boolean;
   normalizedSessionSearchQuery: string;
-  notifyOnSubtasks: boolean;
   editingId: string | null;
   editingRowKey: string | null;
   setEditingId: (id: string | null) => void;
@@ -144,6 +150,8 @@ export type SessionNodeItemProps = {
   alwaysShowActions: boolean;
   secondaryMeta?: SecondaryMeta | null;
   renderContext?: SessionSidebarRenderContext;
+  /** A work's row under its project with Detailed rows on: two lines, keeping the tree slot. */
+  detailed?: boolean;
   blockingBadgeSessionScopes?: readonly BlockingBadgeSessionScope[];
   rowKey?: string;
   dragKey?: string;
@@ -165,7 +173,7 @@ export type SessionNodeItemProps = {
   relativeTimeTick?: number;
   /**
    * Precomputed structural key for this node and its badge-only scopes in
-   * flat Timeline rows. Both row memo boundaries use it to notice changes
+   * flat detailed zone rows. Both row memo boundaries use it to notice changes
    * to hidden descendants without adding them to the rendered node.
    */
   nodeStructureKey: string;
@@ -182,17 +190,6 @@ const areNodeWorktreeRenderSemanticsEqual = (prev: SessionNode, next: SessionNod
   normalizePath(prev.worktree?.path ?? null) === normalizePath(next.worktree?.path ?? null)
   && prev.worktree?.branch === next.worktree?.branch
 );
-
-const EMPTY_LINKED_PULL_REQUESTS: readonly LinkedGitHubPullRequest[] = [];
-const EMPTY_LINKED_SIDEBAR_ISSUES: readonly LinkedSidebarIssue[] = [];
-const EMPTY_LINKED_SIDEBAR_CHANGES: readonly LinkedSidebarChange[] = [];
-
-/** One PR or issue a session row lists in its badge and tooltips. */
-type SessionRefLine = SidebarRefLink & {
-  /** The badge's short form: `#12` or the tracker identifier. */
-  label: string;
-};
-const TIMELINE_ROW_LEFT_PX = 10;
 
 const cancelScrollAnchorByContainer = new WeakMap<HTMLElement, () => void>();
 
@@ -240,6 +237,7 @@ const holdSessionRowPosition = (target: HTMLElement): void => {
 };
 
 type QuickSessionActionProps = {
+  shortcut?: string;
   archiveLabel: string;
   deleteLabel: string;
   buttonSizeClass: string;
@@ -253,6 +251,7 @@ type QuickSessionActionProps = {
 // Extracted so only this small button re-renders when Shift is pressed/released,
 // instead of every mounted session row.
 const QuickSessionAction = React.memo(function QuickSessionAction({
+  shortcut,
   archiveLabel,
   deleteLabel,
   buttonSizeClass,
@@ -279,7 +278,7 @@ const QuickSessionAction = React.memo(function QuickSessionAction({
         <button
           type="button"
           className={cn(
-            'inline-flex items-center justify-center rounded-md focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring transition-opacity',
+            'inline-flex items-center justify-center rounded-md focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring',
             shiftHeld
               ? 'text-destructive hover:text-destructive'
               : 'text-muted-foreground hover:text-foreground',
@@ -295,7 +294,7 @@ const QuickSessionAction = React.memo(function QuickSessionAction({
         </button>
       </TooltipTrigger>
       <TooltipContent side="top" sideOffset={6}>
-        {label}
+        <TooltipLabelWithShortcut label={label} shortcut={shiftHeld ? undefined : shortcut} />
       </TooltipContent>
     </Tooltip>
   );
@@ -307,16 +306,17 @@ function SessionNodeItemComponent(props: SessionNodeItemProps): React.ReactNode 
   const {
     node,
     depth = 0,
+    ownsWork,
     groupDirectory,
     projectId,
     folderOwnerKey,
+    ownerProjectId,
     selectionScopeKey: explicitSelectionScopeKey,
     archivedBucket = false,
     pinnedSessionIds,
     expandedParents,
     hasSessionSearchQuery,
     normalizedSessionSearchQuery,
-    notifyOnSubtasks,
     editingId,
     editingRowKey,
     setEditingId,
@@ -339,6 +339,7 @@ function SessionNodeItemComponent(props: SessionNodeItemProps): React.ReactNode 
     alwaysShowActions,
     secondaryMeta,
     renderContext = 'project',
+    detailed = false,
     blockingBadgeSessionScopes: timelineBadgeSessionScopes,
     rowKey,
     dragKey,
@@ -363,11 +364,12 @@ function SessionNodeItemComponent(props: SessionNodeItemProps): React.ReactNode 
   const showQuickArchiveAction = !archivedBucket && !mobileVariant;
   const sessionWorkEnabled = useUIStore((state) => state.sessionWorkEnabled);
   const sessionRecapEnabled = useUIStore((state) => state.sessionRecapEnabled);
-  // Track / Done belongs to top-level project sessions: Chats are plain
-  // conversations, never work. Touch layouts keep their actions permanently
-  // visible, where an icon on every row would be noise: there it lives in the
-  // session menu only.
-  const canTrackWork = sessionWorkEnabled && !archivedBucket && !node.session.parentID && !isChatDirectoryPath(node.session.directory);
+  // Track / Done belongs to the rows that are works: Chats are plain
+  // conversations, never work, and a session nested in a work is tracked and
+  // finished with it, or one group would mix tracked and finished sessions.
+  // Touch layouts keep their actions permanently visible, where an icon on
+  // every row would be noise: there it lives in the session menu only.
+  const canTrackWork = sessionWorkEnabled && ownsWork && !archivedBucket && !node.session.parentID && !isChatDirectoryPath(node.session.directory);
   const showWorkAction = canTrackWork && !alwaysShowActions;
   // Hover-revealed actions besides the menu: work, quick archive, and in VS
   // Code open-in-editor.
@@ -376,7 +378,6 @@ function SessionNodeItemComponent(props: SessionNodeItemProps): React.ReactNode 
   // room for them there.
   const vscodeAlwaysActionPaddingClass = ['group-hover:pe-8', 'group-hover:pe-14', 'group-hover:pe-18', 'group-hover:pe-22'][extraHoverActions];
   const alwaysActionPaddingClass = showQuickArchiveAction ? 'pe-13' : 'pe-7';
-  const suppressNextSelectRef = React.useRef(false);
   const [isTouchPressed, setIsTouchPressed] = React.useState(false);
   const editingIdRef = React.useRef(editingId);
   editingIdRef.current = editingId;
@@ -405,22 +406,26 @@ function SessionNodeItemComponent(props: SessionNodeItemProps): React.ReactNode 
       return project.label?.trim() || formatDirectoryName(normalizePath(project.path) ?? project.path, null) || project.path;
     }, [projectId, secondaryMeta?.projectLabel]),
   );
-  // Flat rows: no tree gutter, live state on the right. Chats and the Tree
-  // view's Pinned and In work rows keep it on one line.
-  const isOneLineTimelineRow = renderContext === 'timeline-chat' || renderContext === 'tree-chat' || renderContext === 'mixed-compact';
-  const isTimelineRow = isTwoLineTimelineContext(renderContext) || isOneLineTimelineRow;
-  // The Tree view's one-line Chats, Pinned and In work rows never expand, but
-  // they keep the tree's slot and geometry, so their state reads down the
-  // same left edge as the tree under them. List rows stay flat.
-  const hasTreeSlot = hasTreeSlotContext(renderContext);
+  // Chats and the rows of zones that mix projects are one line, with the
+  // tree's slot left of the title for the state and the chevron. Detailed rows
+  // are two lines with no slot: the state sits on the right and the chevron
+  // takes the place of the second line's first icon on hover.
+  const isOneLineTimelineRow = renderContext === 'tree-chat' || renderContext === 'mixed-compact';
+  // A work under its project with Detailed rows on takes the detailed row's
+  // two lines too.
+  const isDetailedTreeRow = detailed && renderContext === 'project';
+  const isTwoLineRow = isMultiLineTimelineContext(renderContext) || isDetailedTreeRow;
+  const isTimelineRow = isTwoLineRow || isOneLineTimelineRow;
   // While the Pinned section is shown it holds every pinned zone session, and
-  // its header already says they are pinned; In work then has none of them.
+  // its header already says they are pinned; In work and the list by time,
+  // whose rows share the zones' context, then have none of them.
   const isZoneRow = renderContext === 'timeline-mixed' || renderContext === 'mixed-compact';
   const pinnedSectionShown = useSessionDisplayStore((state) => state.showPinnedSection);
   const hidePinnedMarker = isZoneRow && pinnedSectionShown;
-  // Two-line rows in Pinned and In work show the project's own icon; the row
-  // reads exactly that one project record, and `find` keeps the reference
-  // stable between renders.
+  // Detailed zone rows name the project with its icon on their second line;
+  // one-line rows leave that room to the title (the row's tooltip names the
+  // project). The row reads exactly that one project record, and `find` keeps
+  // the reference stable between renders.
   const timelineProject = useProjectsStore(
     React.useCallback((state) => {
       if (renderContext !== 'timeline-mixed' || !projectId) return null;
@@ -436,139 +441,35 @@ function SessionNodeItemComponent(props: SessionNodeItemProps): React.ReactNode 
   const tooltipBranchLabel = resolveTooltipBranchLabel(secondaryMeta, node.worktree?.branch ?? null);
   // A space's name stands where a branch would; the mark beside it is the space's, as on its group.
   const branchInSpace = secondaryMeta?.inSpace === true;
-  const prLookup = React.useMemo(
-    () => resolveSessionPrLookup(node.worktree, isVSCode),
-    [isVSCode, node.worktree],
-  );
-  const branchPrSummary = useFreshestSourceControlVisualSummaryForBranch(prLookup?.directory ?? null, prLookup?.branch ?? null);
-  const linkedPullRequests = React.useMemo(
-    () => (isVSCode ? EMPTY_LINKED_PULL_REQUESTS : getLinkedGitHubPullRequests(session)),
-    [isVSCode, session],
-  );
-  const linkedPullLinks = React.useMemo(
-    () => linkedPullRequests.map((link) => ({ item: githubThread('pull', link), url: link.url, title: link.title })),
-    [linkedPullRequests],
-  );
-  const linkedPullVisuals = useTrackedPullVisualSummaries(linkedPullLinks);
-  const linkedPrSummaries = React.useMemo(
-    () => linkedPullVisuals.filter((summary): summary is PrVisualSummary => summary !== null),
-    [linkedPullVisuals],
-  );
-  // Merge and pull requests on other services follow the GitHub ones. GitLab
-  // merge requests carry live state once it arrives; the rest show by
-  // identifier, uncoloured.
-  const linkedChanges = React.useMemo(
-    () => (isVSCode ? EMPTY_LINKED_SIDEBAR_CHANGES : getLinkedSidebarChanges(session)),
-    [isVSCode, session],
-  );
-  const linkedGitLabChanges = React.useMemo(
-    () => linkedChanges.flatMap((change) => (change.gitlab ? [{ item: gitlabThread('pull', change.gitlab), url: change.url, title: change.title }] : [])),
-    [linkedChanges],
-  );
-  const gitlabChangeSummaries = useTrackedPullVisualSummaries(linkedGitLabChanges);
-  // The branch's PR and the PRs and merge requests linked to the session; the
-  // row leads with the one that needs attention first.
-  const prSummaries = React.useMemo(
-    () => combineSessionPrSummaries(branchPrSummary, [
-      ...linkedPrSummaries,
-      ...gitlabChangeSummaries.filter((summary): summary is PrVisualSummary => summary !== null),
-    ]),
-    [branchPrSummary, gitlabChangeSummaries, linkedPrSummaries],
-  );
-  // GitLab merge requests whose state is known are among the PR lines above.
-  const uncolouredChanges = React.useMemo(() => {
-    let gitlabIndex = 0;
-    return linkedChanges.filter((change) => {
-      if (!change.gitlab) return true;
-      const known = gitlabChangeSummaries[gitlabIndex] !== null;
-      gitlabIndex += 1;
-      return !known;
-    });
-  }, [gitlabChangeSummaries, linkedChanges]);
-  const linkedPrsWithoutState = React.useMemo(
-    () => findLinkedPrsWithoutState(linkedPullRequests, prSummaries),
-    [linkedPullRequests, prSummaries],
-  );
-  // The branch icon speaks for the branch, not for PRs linked from elsewhere.
-  const branchPrIconColor = branchPrSummary ? `var(--pr-${branchPrSummary.visualState})` : undefined;
-  // Linked issues show only while the session has no PR: once a PR exists it
-  // is the thing to follow, and it usually closes the issue anyway.
-  const linkedIssues = React.useMemo(
-    () => (isVSCode ? EMPTY_LINKED_SIDEBAR_ISSUES : getLinkedSidebarIssues(session)),
-    [isVSCode, session],
-  );
-  const linkedGitHubIssueItems = React.useMemo(
-    () => linkedIssues.flatMap((issue) => (issue.source === 'github' ? [githubThread('issue', issue)] : [])),
-    [linkedIssues],
-  );
-  const linkedIssueStates = useTrackedIssueStates(linkedGitHubIssueItems);
-  const linkedGitLabIssueItems = React.useMemo(
-    () => linkedIssues.flatMap((issue) => (issue.source === 'gitlab' ? [gitlabThread('issue', issue.ref)] : [])),
-    [linkedIssues],
-  );
-  const linkedGitLabIssueStates = useTrackedIssueStates(linkedGitLabIssueItems);
-  const linkedLinearItems = React.useMemo(
-    () => linkedIssues.flatMap((issue) => (issue.source === 'linear' ? [linearIssue(issue.identifier)] : [])),
-    [linkedIssues],
-  );
-  const linkedLinearStates = useTrackedLinearStates(linkedLinearItems);
-  // What the row's badge and tooltips list: its PRs, or else its issues.
-  const refLines = React.useMemo((): SessionRefLine[] => {
-    if (prSummaries.length > 0 || linkedPrsWithoutState.length > 0 || uncolouredChanges.length > 0) {
-      const githubLines = prSummaries.map((summary): SessionRefLine => {
-        const label = getPrStatusLabel(summary, t);
-        const reference = formatChangeRequestReference(summary.provider, summary.number);
-        return {
-          key: `${summary.provider ?? ''}:${summary.repo?.owner ?? ''}/${summary.repo?.repo ?? ''}#${summary.number}`,
-          icon: 'git-pull-request',
-          label: reference,
-          color: `var(--pr-${summary.visualState})`,
-          url: summary.url,
-          title: summary.title,
-          text: label ? `${reference} · ${label}` : reference,
-        };
-      });
-      const pendingLines = linkedPrsWithoutState.map((link): SessionRefLine => ({
-        key: `${link.owner}/${link.repo}#${link.number}`,
-        icon: 'git-pull-request',
-        label: `#${link.number}`,
-        url: link.url,
-        title: link.title,
-        text: `#${link.number}`,
-      }));
-      const otherLines = uncolouredChanges.map((change): SessionRefLine => ({
-        key: change.key,
-        icon: 'git-pull-request',
-        label: change.identifier,
-        url: change.url,
-        title: change.title,
-        text: change.identifier,
-      }));
-      return [...githubLines, ...pendingLines, ...otherLines];
-    }
-    return buildSessionIssueItems(linkedIssues, linkedIssueStates, linkedLinearStates, linkedGitLabIssueStates).map((item) => ({
-      key: item.key,
-      icon: item.icon,
-      label: item.label,
-      color: item.color ?? undefined,
-      url: item.url,
-      title: item.title,
-      text: item.statusKey ? `${item.label} · ${t(item.statusKey)}` : item.statusText ? `${item.label} · ${item.statusText}` : item.label,
-    }));
-  }, [linkedGitLabIssueStates, linkedIssueStates, linkedIssues, linkedLinearStates, linkedPrsWithoutState, prSummaries, t, uncolouredChanges]);
+  const { refLines, branchPrIconColor } = useSessionRefLines(session, node.worktree, isVSCode);
   const primaryRef = refLines[0] ?? null;
   const moreRefCount = Math.max(0, refLines.length - 1);
   const openTrackerItem = useOpenTrackerItem();
   const refBadgeLabel = refLines.map((line) => line.text).join(', ');
-  const isActive = useSessionUIStore((state) => state.currentSessionId === session.id);
+  // The row is selected while its session is what the screen shows: a run's
+  // overview covers it, and then the run's row is the selected one.
+  const isCurrentSession = useSessionUIStore((state) => state.currentSessionId === session.id);
+  const shortcutOverrides = useUIStore((state) => state.shortcutOverrides);
+  const renameShortcut = formatShortcutForDisplay(getEffectiveShortcutCombo('rename_current_session', shortcutOverrides), '');
+  const archiveShortcut = formatShortcutForDisplay(getEffectiveShortcutCombo('archive_current_session', shortcutOverrides), '');
+  const runOverviewOpen = useUIStore((state) => state.runOverviewKey !== null);
+  const isActive = isCurrentSession && !runOverviewOpen;
 
   const sessionDirectory = normalizePath(session.directory ?? null) ?? normalizePath(groupDirectory ?? null);
+  const sessionProjectId = ownerProjectId === undefined ? projectId : ownerProjectId;
+  // A nested cross-project row uses its own repository for Tracker links.
+  // The project root also resolves before the live worktree map arrives.
+  const projectRootDirectory = useProjectsStore((state) =>
+    sessionProjectId ? state.projects.find((entry) => entry.id === sessionProjectId)?.path ?? null : null,
+  );
+  const trackerDirectory = projectRootDirectory ?? sessionDirectory;
   // Multi-select scope: sessions are flat per project, so selection groups by
   // project (falling back to the directory when no project is known) — a
   // selection must survive mixing sessions from different worktrees.
   const selectionScopeKey = explicitSelectionScopeKey !== undefined
     ? explicitSelectionScopeKey
     : projectId ?? sessionDirectory ?? null;
+  const hasFolderMutationAuthority = folderOwnerKey === undefined ? true : Boolean(folderOwnerKey);
   const loadExportRecords = useSessionMessageRecordsForExport();
   const prefetchSessionMessages = usePrefetchSessionMessages();
   // Same gate as the sidebar's neighbor prefetch: the VS Code webview keeps
@@ -616,7 +517,7 @@ function SessionNodeItemComponent(props: SessionNodeItemProps): React.ReactNode 
   // children, so the tree is resolved when the user picks Export Markdown.
   const [exportTree, setExportTree] = React.useState<SessionNode | null>(null);
 
-  const legacyContextKey = `${renderContext}:${archivedBucket ? 'archived' : 'active'}:${session.id}`;
+  const legacyContextKey = sessionExpansionKey(renderContext, archivedBucket, session.id);
   const menuInstanceKey = rowKey ? `session-menu:${rowKey}` : legacyContextKey;
   const contextMenuInstanceKey = rowKey ? `session-context:${rowKey}` : null;
   const isZombie = useViewportStore(
@@ -626,7 +527,7 @@ function SessionNodeItemComponent(props: SessionNodeItemProps): React.ReactNode 
   const isStreaming = turnActivity !== null;
   // Read as a boolean, not as the value: the row must not re-render on every
   // tick of the counter it only decides to mount.
-  const hasActivityDuration = useHasSessionActivityDuration(session.id, isStreaming);
+  const hasActivityDuration = useHasSessionTurnDuration(session.id, isStreaming);
   const isMovingToWorktree = useIsSessionWorktreeMovePending(session.id);
   const isAiRenaming = useIsSessionAiRenamePending(session.id, sessionDirectory);
   const isSessionActionPending = isMovingToWorktree || isAiRenaming;
@@ -636,14 +537,43 @@ function SessionNodeItemComponent(props: SessionNodeItemProps): React.ReactNode 
   const worktreeSubmenuOpenRef = React.useRef(false);
   const worktreeLoadSequenceRef = React.useRef(0);
   const sessionGoal = getSessionGoal(resolvedSession);
-  const isInWork = canTrackWork && isSessionInWork(resolvedSession);
+  // A root row is its work: the session with the reviews and btw sessions
+  // nested under it. It is in work when any of them is,
+  // and Done closes all of them.
+  const workSessionsInWork = React.useMemo(
+    () => (canTrackWork ? collectSessionWorkInWork(node) : []),
+    [canTrackWork, node],
+  );
+  const isInWork = workSessionsInWork.length > 0;
   const showDoneHint = isInWork && !isStreaming && isDoneSuggested(resolvedSession);
   const workActionLabel = isInWork ? t('sessions.sidebar.session.work.markDone') : t('sessions.sidebar.session.work.track');
   const toggleSessionWork = async () => {
     try {
-      await setSessionWorkState(session.id, sessionDirectory, isInWork ? 'done' : 'open');
+      if (!isInWork) {
+        await setSessionWorkState(session.id, sessionDirectory, 'open');
+        return;
+      }
+      for (const entry of workSessionsInWork) {
+        await setSessionWorkState(entry.id, normalizePath(entry.directory ?? null) ?? sessionDirectory, 'done');
+      }
+      // Done work leaves the working set, as Mark done in the composer does.
+      leaveFinishedSessions(workSessionsInWork.map((entry) => entry.id));
     } catch {
       toast.error(t('sessions.sidebar.session.work.updateFailed'));
+    }
+  };
+  // Per-session warming is offered only while Settings chose it, for a root
+  // session the host's OpenCode runs (a space's sessions run on its own).
+  const perSessionWarming = useSessionWarmingStore((state) => state.enabled);
+  const isWarmed = useSessionWarmUntil(session.id) !== undefined;
+  const canKeepWarm = perSessionWarming && !archivedBucket && !node.session.parentID
+    && Boolean(sessionDirectory) && !isSpaceDirectory(sessionDirectory);
+  const toggleSessionWarm = async () => {
+    if (!sessionDirectory) return;
+    try {
+      await useSessionWarmingStore.getState().setSessionWarm(session.id, sessionDirectory, !isWarmed);
+    } catch {
+      toast.error(t('sessions.warming.toggleFailed'));
     }
   };
   // SAFETY: sessionGoalStatusLabelKey contains an i18n key for every SessionGoalStatus.
@@ -656,11 +586,9 @@ function SessionNodeItemComponent(props: SessionNodeItemProps): React.ReactNode 
     </RowMarkTooltip>
   ) : null;
   const sessionTitle = resolvedSession.title || t('sessions.sidebar.session.untitled');
-  // Rows with the tree slot open to their subsessions, the Tree view's
-  // Chats, Pinned and In work rows included. List is a flat list: a node that
-  // still carries children renders as a leaf, without a chevron and without
-  // an expansion state.
-  const hasChildren = hasTreeSlot && node.children.length > 0;
+  // Every row opens to its subsessions, Chats, Pinned and In work rows
+  // included, detailed or not.
+  const hasChildren = listedChildren(node).length > 0;
   const isPinnedSession = isSessionPinned(pinnedSessionIds, sessionDirectory, session.id);
   // Per-render-context expansion key: the same session can appear in both
   // the project's root and the "Recent" list, and expanding one should not
@@ -676,8 +604,7 @@ function SessionNodeItemComponent(props: SessionNodeItemProps): React.ReactNode 
     hasForm: hasPendingForm,
   } = useSessionBlockingRequests(blockingBadgeSessionScopes);
   const isSubtaskSession = Boolean(resolvedSession.parentID);
-  const unseenCount = useSessionUnseenCount(session.id);
-  const needsAttention = unseenCount > 0 && (!isSubtaskSession || notifyOnSubtasks);
+  const needsAttention = useSessionUnread(session.id);
   // The last conversation, as the list orders by: a rename or a metadata
   // write must not make an old session read as just used.
   const sessionTimestamp = getSessionActivityTime(resolvedSession) || Date.now();
@@ -689,7 +616,6 @@ function SessionNodeItemComponent(props: SessionNodeItemProps): React.ReactNode 
     handleMenuOpenChange,
     handleContextMenuOpenChange,
     handleMenuOpenChangeComplete,
-    toggleMenu,
   } = useSessionRowMenuState({
     menuInstanceKey,
     contextMenuInstanceKey,
@@ -926,16 +852,18 @@ function SessionNodeItemComponent(props: SessionNodeItemProps): React.ReactNode 
         </button>
       </form>
     );
-    if (!hasTreeSlot) {
+    if (isTwoLineRow) {
       // Renaming keeps the whole card in place: the title line becomes the
-      // input, project and branch stay where they were.
+      // input, project and branch stay where they were, the slot stays empty.
       return (
         <div
           key={session.id}
-          style={{ paddingInlineStart: TIMELINE_ROW_LEFT_PX }}
+          // The virtual list's 1px margins apply to the row box, rename included.
+          data-session-row-box=""
+          style={{ paddingInlineStart: sessionDetailedRowPaddingLeft(depth) }}
           className={cn(
-            'oc-ref-tint-scope group relative my-0.5 flex items-center rounded-md pe-2.5',
-            isOneLineTimelineRow ? 'py-1' : 'py-1.5',
+            'group relative my-0.5 flex items-center rounded-md pe-2.5',
+            'py-1.5',
             isActive && 'bg-interactive-selection/70 text-interactive-selection-foreground',
           )}
         >
@@ -949,14 +877,13 @@ function SessionNodeItemComponent(props: SessionNodeItemProps): React.ReactNode 
             spaceMark={branchInSpace ? t('sessions.sidebar.group.space') : null}
             statusDot={null}
             pinnedMarker={null}
-            timeSlot={sessionCompactUpdatedLabel}
+            timeSlot={null}
             directoryIndicator={null}
             prBadge={primaryRef ? (
               <span
-                className={cn('inline-flex flex-shrink-0 items-center gap-1 typography-micro', primaryRef.color ? 'oc-ref-tint' : 'text-muted-foreground')}
-                style={primaryRef.color ? refTintStyle(primaryRef.color) : undefined}
+                className="inline-flex flex-shrink-0 items-center gap-1 typography-micro text-muted-foreground"
               >
-                <Icon name={primaryRef.icon} className="h-3 w-3" />
+                <Icon name={primaryRef.icon} className={cn('h-3 w-3', primaryRef.color && 'oc-ref-tint')} style={primaryRef.color ? refTintStyle(primaryRef.color) : undefined} />
                 {isOneLineTimelineRow ? null : <>
                   <span className="leading-none tabular-nums">{primaryRef.label}</span>
                   {moreRefCount > 0 ? <span className="leading-none tabular-nums text-muted-foreground">+{moreRefCount}</span> : null}
@@ -974,10 +901,11 @@ function SessionNodeItemComponent(props: SessionNodeItemProps): React.ReactNode 
     return (
       <div
         key={session.id}
+        data-session-row-box=""
         style={{ paddingInlineStart: sessionTreeRowPaddingLeft(depth) }}
         // my-0.5 matches the normal row box so entering rename mode does not
         // shift the row vertically; the empty slot keeps the title in place.
-        className={cn('group relative my-0.5 flex items-center gap-1.5 rounded-md pe-2.5', isTimelineRow ? 'py-1' : 'py-[3px]')}
+        className="group relative my-0.5 flex items-center gap-1.5 rounded-md py-[5px] pe-2.5"
       >
         <span aria-hidden className="h-3.5 w-3.5 flex-shrink-0" />
         <div className="flex min-w-0 flex-1 flex-col gap-0">
@@ -996,15 +924,15 @@ function SessionNodeItemComponent(props: SessionNodeItemProps): React.ReactNode 
   // The settled duration lives exactly as long as the unread marker does, so a
   // session read (or watched) while it finishes never keeps a stale total.
   const showActivityDuration = (isStreaming || showUnreadStatus) && hasActivityDuration;
-  // Hover-revealed actions cross-fade over the row's right end instead of
-  // pushing the title: the meta they cover fades out and the title's tail
+  // Hover-revealed actions swap in over the row's right end instead of
+  // pushing the title: the meta they cover hides and the title's tail
   // fades away under them (`oc-actions-mask`), so nothing moves. The reserve
   // is how far the actions reach in from the row content's right edge: their
   // width less the 6px they sit nearer the row edge (16px buttons, 20px on
   // two-line timeline rows, 2px apart).
   const actionsReserveClass = isTimelineRow && !isOneLineTimelineRow
-    ? ['[--oc-actions-reserve:14px]', '[--oc-actions-reserve:36px]', '[--oc-actions-reserve:58px]', '[--oc-actions-reserve:80px]'][extraHoverActions]
-    : ['[--oc-actions-reserve:10px]', '[--oc-actions-reserve:28px]', '[--oc-actions-reserve:46px]', '[--oc-actions-reserve:64px]'][extraHoverActions];
+    ? ['[--oc-actions-reserve:0.875rem]', '[--oc-actions-reserve:2.25rem]', '[--oc-actions-reserve:3.625rem]', '[--oc-actions-reserve:5rem]'][extraHoverActions]
+    : ['[--oc-actions-reserve:0.625rem]', '[--oc-actions-reserve:1.75rem]', '[--oc-actions-reserve:2.875rem]', '[--oc-actions-reserve:4rem]'][extraHoverActions];
   // An open row menu (dropdown or right-click) keeps the actions shown, so
   // what they cover gives way too, hover or not.
   const actionsMaskClass = alwaysShowActions
@@ -1019,26 +947,55 @@ function SessionNodeItemComponent(props: SessionNodeItemProps): React.ReactNode 
   const pinnedMarkerContent = (
     <RowMarkTooltip label={pinnedLabel}>
       <span className="inline-flex flex-shrink-0 items-center" aria-label={pinnedLabel}>
-        <Icon name="pushpin" className="h-3 w-3 text-primary" />
+        <Icon name="pushpin" className="h-3 w-3 text-muted-foreground" />
       </span>
     </RowMarkTooltip>
   );
   const sessionActionSpinner = (
     <Icon
       name="loader-4"
-      className="h-3 w-3 flex-shrink-0 animate-spin text-primary"
+      className="h-3 w-3 flex-shrink-0 animate-spin text-status-info"
       aria-label={isAiRenaming ? t('sessions.aiRename.generating') : t('sessions.sidebar.session.status.movingToWorktree')}
     />
   );
-  const liveStateMark = isSessionActionPending ? sessionActionSpinner : showStatusMarker ? statusMarkerContent : null;
+  // A request waiting on the user stands for the turn: the session is stopped
+  // on it, so the running mark and its timer step aside for the one warning
+  // mark (the timer reads its start from the store and resumes where it is).
+  const waitingOnUser = hasPendingPermission || hasPendingForm;
+  const liveStateMark = isSessionActionPending ? sessionActionSpinner : showStatusMarker && !waitingOnUser ? statusMarkerContent : null;
   // Grouped rows are file tree rows: one indent per level, then a slot left
-  // of the title. The slot shows the live state, where the eye runs
-  // down the titles; a session with subsessions trades it for its chevron
-  // while the row is hovered or focused. Touch layouts have no hover, so there
-  // a parent keeps its chevron and its state stays on the right, where List
-  // rows, flat by design, always show it.
-  const stateInSlot = hasTreeSlot && liveStateMark !== null && !(hasChildren && alwaysShowActions);
-  const treeChevron = hasChildren ? (
+  // of the title. The slot says what a row is (a worktree's branch, a run's
+  // mark, a session's chevron when it has subsessions) and never its state:
+  // the live state sits on the right before the time on every row, so a
+  // running mark never hides a worktree's branch (maintainer, 2026-10-26).
+  const treeChevron = hasChildren && !isTwoLineRow ? (
+    <span
+      role="button"
+      tabIndex={0}
+      onClick={(event) => {
+        event.stopPropagation();
+        event.currentTarget.blur();
+        toggleParent(expansionKey);
+      }}
+      onKeyDown={(event) => {
+        if (event.key === 'Enter' || event.key === ' ') {
+          event.preventDefault();
+          event.stopPropagation();
+          toggleParent(expansionKey);
+        }
+      }}
+      className="inline-flex h-3.5 w-3.5 flex-shrink-0 items-center justify-center rounded-md text-muted-foreground hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+      aria-label={isExpanded
+        ? t('sessions.sidebar.session.subsessions.collapse')
+        : t('sessions.sidebar.session.subsessions.expand')}
+      aria-expanded={isExpanded}
+    >
+      <FileTreeChevron expanded={isExpanded} />
+    </span>
+  ) : null;
+  // A two-line row's chevron sits over the second line's first icon, shown
+  // while the row is hovered or focused (always on touch layouts).
+  const leadToggle = isTwoLineRow && hasChildren ? (
     <span
       role="button"
       tabIndex={0}
@@ -1055,8 +1012,8 @@ function SessionNodeItemComponent(props: SessionNodeItemProps): React.ReactNode 
         }
       }}
       className={cn(
-        'inline-flex h-3.5 w-3.5 flex-shrink-0 items-center justify-center rounded-md text-muted-foreground hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring',
-        stateInSlot && 'opacity-0 transition-opacity group-hover:opacity-100 group-has-[:focus-visible]:opacity-100',
+        'absolute inset-0 inline-flex items-center justify-center rounded-sm text-muted-foreground hover:text-foreground focus-visible:outline-none',
+        !alwaysShowActions && 'opacity-0 group-hover:opacity-100 group-has-[:focus-visible]:opacity-100',
       )}
       aria-label={isExpanded
         ? t('sessions.sidebar.session.subsessions.collapse')
@@ -1066,36 +1023,25 @@ function SessionNodeItemComponent(props: SessionNodeItemProps): React.ReactNode 
       <FileTreeChevron expanded={isExpanded} />
     </span>
   ) : null;
-  const treeSlot = !hasTreeSlot ? null : stateInSlot ? (
-    <span className="relative inline-flex h-3.5 w-3.5 flex-shrink-0 items-center justify-center">
-      {treeChevron}
-      {treeChevron ? (
-        // Under the pointer the chevron takes over, so the mark passes the
-        // pointer through to it.
-        <span className="pointer-events-none absolute inset-0 inline-flex items-center justify-center transition-opacity group-hover:opacity-0 group-has-[:focus-visible]:opacity-0">
-          {liveStateMark}
-        </span>
-      ) : liveStateMark}
-    </span>
-  ) : treeChevron ?? <span aria-hidden className="h-3.5 w-3.5 flex-shrink-0" />;
+  const leadIconClassName = alwaysShowActions ? 'opacity-0' : 'group-hover:opacity-0 group-has-[:focus-visible]:opacity-0';
+  const treeSlot = isTwoLineRow ? null : treeChevron ?? <span aria-hidden className="h-3.5 w-3.5 flex-shrink-0" />;
 
   const streamingIndicator = isZombie
     ? <Icon name="error-warning" className="h-4 w-4 text-status-warning" />
     : null;
 
+  // Base UI's trigger handlers open the menu, so it records the click and
+  // stays open when the pointer leaves it. A menu opened only through `open`
+  // has no open event, and Base UI closes it on pointer leave like a hover menu.
   const handleMenuTriggerClick = (event: React.MouseEvent<HTMLButtonElement>) => {
-    event.preventDefault();
     event.stopPropagation();
-    toggleMenu();
   };
 
   const handleMenuTriggerPointerDown = (event: React.PointerEvent<HTMLButtonElement>) => {
-    event.preventDefault();
     event.stopPropagation();
   };
 
   const handleMenuTriggerMouseDown = (event: React.MouseEvent<HTMLButtonElement>) => {
-    event.preventDefault();
     event.stopPropagation();
   };
 
@@ -1140,10 +1086,10 @@ function SessionNodeItemComponent(props: SessionNodeItemProps): React.ReactNode 
   };
 
   const handleRowSelect = (event?: React.MouseEvent<HTMLElement>) => {
-    if (suppressNextSelectRef.current) {
-      suppressNextSelectRef.current = false;
-      return;
-    }
+    // Ctrl+click opens the context menu on macOS. Decided from the click
+    // itself: a right button press fires no click, so a flag set on press
+    // stayed set and swallowed the next real click.
+    if (event?.ctrlKey && !selectionModeEnabled) return;
     if (selectionModeEnabled) {
       event?.preventDefault();
       event?.stopPropagation();
@@ -1180,17 +1126,10 @@ function SessionNodeItemComponent(props: SessionNodeItemProps): React.ReactNode 
   // that did not originate from an interactive child (title button, chevron,
   // action menu), so nothing double-fires.
   const handleRowBackgroundClick = (event: React.MouseEvent<HTMLDivElement>) => {
-    if (event.defaultPrevented) return;
-    // SAFETY: React click targets are DOM EventTargets; closest is valid only for HTMLElements.
-    const target = event.target instanceof HTMLElement ? event.target : null;
-    if (target?.closest('button, a, input, [data-session-row-main], [role="menuitem"], [role="menu"]')) return;
-    handleRowSelect(event);
+    if (isRowBoxClick(event)) handleRowSelect(event);
   };
 
   const handleRowMouseDown = (event: React.MouseEvent<HTMLDivElement>) => {
-    if (event.button === 2 || (event.button === 0 && event.ctrlKey && !selectionModeEnabled)) {
-      suppressNextSelectRef.current = true;
-    }
     // Shift-click opens the session in the side panel; without this the
     // browser extends the text selection across the sidebar.
     if (event.button === 0 && event.shiftKey && !selectionModeEnabled) {
@@ -1296,6 +1235,7 @@ function SessionNodeItemComponent(props: SessionNodeItemProps): React.ReactNode 
       >
         <Icon name="pencil-ai" className="me-1 h-4 w-4" />
         {t('sessions.sidebar.session.menu.rename')}
+        {isCurrentSession && renameShortcut ? <span className="ms-auto ps-3 typography-meta text-muted-foreground">{renameShortcut}</span> : null}
       </Item>
       </SessionMenuItemHint>
       <SessionAiRenameMenuItem sessionID={session.id} directory={sessionDirectory} open={isSessionMenuOpen} Item={Item} />
@@ -1305,24 +1245,35 @@ function SessionNodeItemComponent(props: SessionNodeItemProps): React.ReactNode 
         {t('sessions.sidebar.session.menu.copyId')}
       </Item>
       </SessionMenuItemHint>
-      <SessionMenuItemHint hint={isPinnedSession ? t('sessions.sidebar.session.menuHint.unpin') : t('sessions.sidebar.session.menuHint.pin')}>
-      <Item
-        onClick={() => {
+      <PinToMenu
+        slots={{ Item, Separator, Sub, SubTrigger, SubContent }}
+        current={isPinnedSession ? getSessionPinList(session) ?? DEFAULT_PIN_LIST : null}
+        triggerClassName="[&>svg]:me-1"
+        itemClassName="[&>svg]:me-1"
+        onPin={(list) => {
           if (!sessionDirectory) return;
-          const failedKey = isPinnedSession ? 'sessions.sidebar.session.pin.unpinFailed' : 'sessions.sidebar.session.pin.pinFailed';
-          toggleSessionPin({ directory: sessionDirectory, sessionId: session.id }).catch(() => toast.error(t(failedKey)));
+          setSessionPinList({ directory: sessionDirectory, sessionId: session.id }, true, list)
+            .catch(() => toast.error(t('sessions.sidebar.session.pin.pinFailed')));
         }}
-        className="[&>svg]:me-1"
-      >
-        {isPinnedSession ? <Icon name="unpin" className="me-1 h-4 w-4" /> : <Icon name="pushpin" className="me-1 h-4 w-4" />}
-        {isPinnedSession ? t('sessions.sidebar.session.menu.unpin') : t('sessions.sidebar.session.menu.pin')}
-      </Item>
-      </SessionMenuItemHint>
+        onUnpin={() => {
+          if (!sessionDirectory) return;
+          setSessionPinList({ directory: sessionDirectory, sessionId: session.id }, false, null)
+            .catch(() => toast.error(t('sessions.sidebar.session.pin.unpinFailed')));
+        }}
+      />
       {canTrackWork ? (
         <SessionMenuItemHint hint={isInWork ? t('sessions.sidebar.session.menuHint.markDone') : t('sessions.sidebar.session.menuHint.track')}>
         <Item onClick={() => { void toggleSessionWork(); }} className="[&>svg]:me-1">
           <Icon name={isInWork ? 'check' : 'eye'} className="me-1 h-4 w-4" />
           {isInWork ? t('sessions.sidebar.session.work.markDone') : t('sessions.sidebar.session.work.track')}
+        </Item>
+        </SessionMenuItemHint>
+      ) : null}
+      {canKeepWarm ? (
+        <SessionMenuItemHint hint={isWarmed ? t('sessions.sidebar.session.menuHint.stopWarm') : t('sessions.sidebar.session.menuHint.keepWarm')}>
+        <Item onClick={() => { void toggleSessionWarm(); }} className="[&>svg]:me-1">
+          <Icon name={isWarmed ? 'fire-fill' : 'fire'} className="me-1 h-4 w-4" />
+          {isWarmed ? t('sessions.sidebar.session.menu.stopWarm') : t('sessions.sidebar.session.menu.keepWarm')}
         </Item>
         </SessionMenuItemHint>
       ) : null}
@@ -1451,7 +1402,7 @@ function SessionNodeItemComponent(props: SessionNodeItemProps): React.ReactNode 
         </SessionMenuItemHint>
       ) : null}
 
-      {sessionDirectory && !archivedBucket && !isTimelineRow ? (() => {
+      {sessionDirectory && !archivedBucket && !isTimelineRow && hasFolderMutationAuthority ? (() => {
         // Folders are flat per project: list folders from every scope of the
         // owning project (root + all worktrees) so sessions can be filed
         // across worktrees. Each action targets the folder's owning scope,
@@ -1461,8 +1412,8 @@ function SessionNodeItemComponent(props: SessionNodeItemProps): React.ReactNode 
           const normalized = normalizePath(candidate ?? null);
           if (normalized && !scopes.includes(normalized)) scopes.push(normalized);
         };
-        if (projectId && !isVSCode) {
-          const project = useProjectsStore.getState().projects.find((entry) => entry.id === projectId);
+        if (sessionProjectId && !isVSCode) {
+          const project = useProjectsStore.getState().projects.find((entry) => entry.id === sessionProjectId);
           const projectRoot = normalizePath(project?.path ?? null);
           pushScope(projectRoot);
           if (projectRoot) {
@@ -1496,8 +1447,8 @@ function SessionNodeItemComponent(props: SessionNodeItemProps): React.ReactNode 
                           removeSessionFromFolder(scope, session.id);
                           return;
                         }
-                        if (currentEntry && currentEntry.scope !== scope) {
-                          removeSessionFromFolder(currentEntry.scope, session.id);
+                        for (const candidateScope of scopes) {
+                          if (candidateScope !== scope) removeSessionFromFolder(candidateScope, session.id);
                         }
                         addSessionToFolder(scope, folder.id, session.id);
                       }}>
@@ -1512,8 +1463,8 @@ function SessionNodeItemComponent(props: SessionNodeItemProps): React.ReactNode 
                    const newFolder = createFolderAndStartRename(defaultScope);
                    if (!newFolder) return;
                    pendingFolderCreateRef.current = true;
-                  if (currentEntry && currentEntry.scope !== defaultScope) {
-                    removeSessionFromFolder(currentEntry.scope, session.id);
+                  for (const scope of scopes) {
+                    if (scope !== defaultScope) removeSessionFromFolder(scope, session.id);
                   }
                   addSessionToFolder(defaultScope, newFolder.id, session.id);
                 }}>
@@ -1564,6 +1515,7 @@ function SessionNodeItemComponent(props: SessionNodeItemProps): React.ReactNode 
         <Item className="[&>svg]:me-1" onClick={() => handleDeleteSession(session, { archivedBucket })}>
           <Icon name="inbox-archive" className="me-1 h-4 w-4" />
           {t('sessions.sidebar.bulkActions.archive')}
+          {isCurrentSession && archiveShortcut ? <span className="ms-auto ps-3 typography-meta text-muted-foreground">{archiveShortcut}</span> : null}
         </Item>
         </SessionMenuItemHint>
       ) : null}
@@ -1590,7 +1542,7 @@ function SessionNodeItemComponent(props: SessionNodeItemProps): React.ReactNode 
     void toggleSessionWork();
   };
 
-  // Three-line timeline rows are taller, so their hover actions step up one
+  // Two-line zone rows are taller, so their hover actions step up one
   // size to match the metadata they replace (the pin marker, the dot, the time).
   const actionButtonSizeClass = alwaysShowActions ? 'h-6 w-6' : isTimelineRow && !isOneLineTimelineRow ? 'h-5 w-5' : 'h-4 w-4';
   const actionIconSizeClass = alwaysShowActions ? 'h-3.5 w-3.5' : isTimelineRow && !isOneLineTimelineRow ? 'h-3 w-3' : 'h-2.5 w-2.5';
@@ -1606,7 +1558,7 @@ function SessionNodeItemComponent(props: SessionNodeItemProps): React.ReactNode 
   const doneHintLabel = t('sessions.sidebar.session.work.doneSuggested');
   const doneHintBadge = (className?: string) => (showDoneHint ? (
     <RowMarkTooltip label={doneHintLabel}>
-      <span className={cn('inline-flex flex-shrink-0 items-center text-muted-foreground/75', className)} aria-label={doneHintLabel}>
+      <span className={cn('inline-flex flex-shrink-0 items-center text-muted-foreground', className)} aria-label={doneHintLabel}>
         <Icon name="check" className="h-3.5 w-3.5" />
       </span>
     </RowMarkTooltip>
@@ -1616,14 +1568,14 @@ function SessionNodeItemComponent(props: SessionNodeItemProps): React.ReactNode 
     <>
       {hasPendingPermission ? (
         <RowMarkTooltip label={permissionLabel}>
-          <span className="inline-flex flex-shrink-0 items-center rounded bg-destructive/10 px-1 py-0.5 text-destructive" aria-label={permissionLabel}>
+          <span className="inline-flex flex-shrink-0 items-center text-status-warning" aria-label={permissionLabel}>
             <Icon name="shield" className="h-3 w-3" />
           </span>
         </RowMarkTooltip>
       ) : null}
       {hasPendingForm ? (
         <RowMarkTooltip label={pendingFormLabel}>
-          <span className="inline-flex flex-shrink-0 items-center rounded bg-status-info/10 px-1 py-0.5 text-status-info" aria-label={pendingFormLabel}>
+          <span className="inline-flex flex-shrink-0 items-center text-status-warning" aria-label={pendingFormLabel}>
             <Icon name="question" className="h-3 w-3" />
           </span>
         </RowMarkTooltip>
@@ -1639,10 +1591,8 @@ function SessionNodeItemComponent(props: SessionNodeItemProps): React.ReactNode 
         <button
           type="button"
           className={cn(
-            'inline-flex flex-shrink-0 items-center gap-1 rounded typography-micro hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:cursor-default disabled:no-underline',
-            primaryRef.color ? 'oc-ref-tint' : 'text-muted-foreground',
+            'inline-flex flex-shrink-0 items-center gap-1 rounded typography-micro text-muted-foreground hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:cursor-default disabled:no-underline',
           )}
-          style={primaryRef.color ? refTintStyle(primaryRef.color) : undefined}
           disabled={!primaryRef.url}
           aria-label={refBadgeLabel}
           onPointerDown={handleRowActionPointerDown}
@@ -1652,11 +1602,12 @@ function SessionNodeItemComponent(props: SessionNodeItemProps): React.ReactNode 
             event.stopPropagation();
             // The `+N` only counts the others; the tooltip lists them.
             if (event.target instanceof Element && event.target.closest('[data-ref-more]')) return;
-            if (primaryRef.url) openTrackerItem(primaryRef.url, sessionDirectory, event);
+            if (primaryRef.url) openTrackerItem(primaryRef.url, trackerDirectory, event);
           }}
           onKeyDown={(event) => event.stopPropagation()}
         >
-          <Icon name={primaryRef.icon} className="h-3 w-3" />
+          {/* The state's colour is on the mark alone; the number stays neutral. */}
+          <Icon name={primaryRef.icon} className={cn('h-3 w-3', primaryRef.color && 'oc-ref-tint')} style={primaryRef.color ? refTintStyle(primaryRef.color) : undefined} />
           {/* One-line rows keep the coloured mark only; its tooltip lists every link. */}
           {isOneLineTimelineRow ? null : <>
             <span className="leading-none tabular-nums">{primaryRef.label}</span>
@@ -1665,7 +1616,7 @@ function SessionNodeItemComponent(props: SessionNodeItemProps): React.ReactNode 
         </button>
       </TooltipTrigger>
       <TooltipContent side="top" sideOffset={6} className="max-w-xs">
-        <SidebarRefLinks items={refLines} directory={sessionDirectory} />
+        <SidebarRefLinks items={refLines} directory={trackerDirectory} />
       </TooltipContent>
     </Tooltip>
   ) : null;
@@ -1674,7 +1625,9 @@ function SessionNodeItemComponent(props: SessionNodeItemProps): React.ReactNode 
   // one-line form, with the session's live state and time on the right.
   const rowBody = (
     <SessionTimelineRowBody
-      compact={!isTwoLineTimelineContext(renderContext)}
+      compact={!isTwoLineRow}
+      leadToggle={leadToggle}
+      leadIconClassName={leadToggle ? leadIconClassName : undefined}
       project={timelineProject}
       projectLabel={tooltipProjectLabel}
       title={renderHighlightedText(sessionTitle, normalizedSessionSearchQuery)}
@@ -1685,14 +1638,16 @@ function SessionNodeItemComponent(props: SessionNodeItemProps): React.ReactNode 
         ? 'text-interactive-selection-foreground'
         : showUnreadStatus || hasPendingPermission || hasPendingForm
           ? 'font-semibold text-foreground'
-          : isStreaming ? 'text-foreground' : 'text-muted-foreground'}
+          : isStreaming ? 'text-foreground' : 'oc-title-rest'}
       branchLabel={tooltipBranchLabel}
       spaceMark={branchInSpace ? t('sessions.sidebar.group.space') : null}
-      statusDot={stateInSlot ? null : liveStateMark}
+      statusDot={liveStateMark}
       pinnedMarker={isPinnedSession && !isSessionActionPending && !hidePinnedMarker ? pinnedMarkerContent : null}
-      timeSlot={showActivityDuration
+      // No date: the list is ordered by recency and the row's tooltip carries
+      // the time. A turn's duration shows while it runs and until it is read.
+      timeSlot={showActivityDuration && !waitingOnUser
         ? <SessionActivityDuration sessionId={session.id} running={isStreaming} className="typography-micro" />
-        : sessionCompactUpdatedLabel}
+        : null}
       // Project rows leave the action indicator to their worktree header.
       directoryIndicator={!archivedBucket && sessionDirectory && renderContext !== 'project' ? <DirectoryActionIndicator directory={sessionDirectory} /> : null}
       prBadge={timelinePrBadge}
@@ -1700,7 +1655,6 @@ function SessionNodeItemComponent(props: SessionNodeItemProps): React.ReactNode 
       goal={sessionGoalGlyph}
       badges={rowBadges}
       doneHint={doneHintBadge()}
-      providerId={isTimelineRow ? resolvedSession.model?.providerID ?? null : null}
       // Grouped rows reserve room for permanent actions on their button.
       metaPaddingClass={isTimelineRow && alwaysShowActions
         ? (showQuickArchiveAction ? 'pe-13' : 'pe-7')
@@ -1791,19 +1745,20 @@ function SessionNodeItemComponent(props: SessionNodeItemProps): React.ReactNode 
             render={
               <div
                 data-session-row={session.id}
+                data-session-row-box=""
                 data-session-scope={selectionScopeKey ?? ''}
                 data-session-archived={archivedBucket ? '1' : '0'}
                 aria-current={isActive ? 'page' : undefined}
                 onClick={handleRowBackgroundClick}
-                // List rows have no gutter: their content sits 10px in.
-                // Rows with the tree slot use the file tree geometry: 12px per
-                // level from an 8px edge, then the slot and a 6px gap.
-                style={{ paddingInlineStart: hasTreeSlot ? sessionTreeRowPaddingLeft(depth) : TIMELINE_ROW_LEFT_PX }}
+                // The file tree geometry: 12px per level from an 8px edge,
+                // then the slot and a 6px gap; a two-line row has no slot.
+                style={{ paddingInlineStart: isTwoLineRow ? sessionDetailedRowPaddingLeft(depth) : sessionTreeRowPaddingLeft(depth) }}
                 className={cn(
-                  'oc-ref-tint-scope group relative my-0.5 flex cursor-pointer items-center rounded-md pe-2.5',
-                  hasTreeSlot && 'gap-1.5',
-                  // Tree rows sit a little tighter than the timeline's.
-                  isTimelineRow ? (isOneLineTimelineRow ? 'py-1' : 'py-1.5') : 'py-[3px]',
+                  'group relative my-0.5 flex cursor-pointer items-center rounded-md pe-2.5',
+                  !isTwoLineRow && 'gap-1.5',
+                  // A one-line row is a little shorter than a two-line one's
+                  // padding: the list reads denser without the rows touching.
+                  isTwoLineRow ? 'py-1.5' : 'py-[5px]',
                   !(isActive || isRowSelected) && 'hover:bg-interactive-hover/60',
                   (isActive || isRowSelected) && 'bg-interactive-selection/70 text-interactive-selection-foreground',
                   isRowSelected && 'ring-1 ring-inset ring-border',
@@ -1877,12 +1832,12 @@ function SessionNodeItemComponent(props: SessionNodeItemProps): React.ReactNode 
                     {tooltipBranchLabel ? (
                       <div className="flex min-w-0 items-center gap-1.5 text-muted-foreground">
                         {branchInSpace
-                          ? <Icon name="box-3" className="h-3 w-3 flex-shrink-0" aria-hidden={false} role="img" aria-label={t('sessions.sidebar.group.space')} />
+                          ? <Icon name="instance" className="h-3 w-3 flex-shrink-0" aria-hidden={false} role="img" aria-label={t('sessions.sidebar.group.space')} />
                           : <Icon name="git-branch" className={cn('h-3 w-3 flex-shrink-0', branchPrIconColor && 'oc-ref-tint')} style={branchPrIconColor ? refTintStyle(branchPrIconColor) : undefined} />}
                         <span className="min-w-0 truncate">{tooltipBranchLabel}</span>
                       </div>
                     ) : null}
-                    {refLines.length > 0 ? <SidebarRefLinks items={refLines} directory={sessionDirectory} /> : null}
+                    {refLines.length > 0 ? <SidebarRefLinks items={refLines} directory={trackerDirectory} /> : null}
                     {currentRecap ? (
                       <p className="min-w-0 line-clamp-4 text-muted-foreground">{currentRecap}</p>
                     ) : null}
@@ -1900,10 +1855,10 @@ function SessionNodeItemComponent(props: SessionNodeItemProps): React.ReactNode 
           ) : null}
 
           <div className={cn(
-            'absolute inset-e-1 z-10 flex items-center gap-0.5 transition-opacity',
+            'absolute inset-e-1 z-10 flex items-center gap-0.5',
             // Timeline actions overlay the first line's right cluster, not the
             // row's vertical centre.
-            // Three-line rows: the row's 6px top padding plus the fixed 20px
+            // Two-line rows: the row's 6px top padding plus the fixed 20px
             // first line, so the 20px buttons cover that line exactly.
             isTimelineRow && !isOneLineTimelineRow ? 'top-1.5 h-5' : 'top-1/2 -translate-y-1/2',
             isSessionMenuOpen
@@ -1922,7 +1877,7 @@ function SessionNodeItemComponent(props: SessionNodeItemProps): React.ReactNode 
                   <button
                     type="button"
                     className={cn(
-                      'inline-flex items-center justify-center rounded-md focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring transition-opacity',
+                      'inline-flex items-center justify-center rounded-md focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring',
                       actionButtonSizeClass,
                       isInWork ? 'text-status-success' : 'text-muted-foreground hover:text-foreground',
                     )}
@@ -1945,6 +1900,7 @@ function SessionNodeItemComponent(props: SessionNodeItemProps): React.ReactNode 
             {showQuickArchiveAction ? (
               <QuickSessionAction
                 archiveLabel={t('sessions.sidebar.bulkActions.archive')}
+                shortcut={isCurrentSession ? archiveShortcut : undefined}
                 deleteLabel={t('sessions.sidebar.bulkActions.delete')}
                 buttonSizeClass={actionButtonSizeClass}
                 iconSizeClass={actionIconSizeClass}
@@ -1960,7 +1916,7 @@ function SessionNodeItemComponent(props: SessionNodeItemProps): React.ReactNode 
                   <button
                     type="button"
                     className={cn(
-                      'inline-flex items-center justify-center rounded-md text-muted-foreground hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring transition-opacity',
+                      'inline-flex items-center justify-center rounded-md text-muted-foreground hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring',
                       actionButtonSizeClass,
                     )}
                     aria-label={t('sessions.sidebar.session.actions.openInEditor')}
@@ -1982,7 +1938,7 @@ function SessionNodeItemComponent(props: SessionNodeItemProps): React.ReactNode 
                 <button
                   type="button"
                   className={cn(
-                    'inline-flex items-center justify-center rounded-md text-muted-foreground hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring transition-opacity',
+                    'inline-flex items-center justify-center rounded-md text-muted-foreground hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring',
                     !alwaysShowActions
                       ? (isSessionMenuOpen
                           ? 'h-4 w-4 opacity-100'
@@ -2151,15 +2107,19 @@ const sessionNodeItemPropsChange = (prev: SessionNodeItemProps, next: SessionNod
   if (!areSessionRenderSemanticsEqual(prev.node.session, next.node.session)) return 'node';
   if (!areNodeWorktreeRenderSemanticsEqual(prev.node, next.node)) return 'node';
   if (prev.depth !== next.depth) return 'depth';
+  if (prev.ownsWork !== next.ownsWork) return 'ownsWork';
   if (prev.groupDirectory !== next.groupDirectory) return 'groupDirectory';
   if (prev.projectId !== next.projectId) return 'projectId';
+  if (prev.ownerProjectId !== next.ownerProjectId) return 'ownerProjectId';
+  if (prev.folderOwnerKey !== next.folderOwnerKey) return 'folderOwnerKey';
+  if (prev.selectionScopeKey !== next.selectionScopeKey) return 'selectionScopeKey';
   if (prev.archivedBucket !== next.archivedBucket) return 'archivedBucket';
   if ((prev.renderContext ?? 'project') !== (next.renderContext ?? 'project')) return 'renderContext';
+  if ((prev.detailed ?? false) !== (next.detailed ?? false)) return 'detailed';
   if (prev.mobileVariant !== next.mobileVariant) return 'mobileVariant';
   if (prev.alwaysShowActions !== next.alwaysShowActions) return 'alwaysShowActions';
   if (prev.hasSessionSearchQuery !== next.hasSessionSearchQuery) return 'hasSessionSearchQuery';
   if (prev.normalizedSessionSearchQuery !== next.normalizedSessionSearchQuery) return 'normalizedSessionSearchQuery';
-  if (prev.notifyOnSubtasks !== next.notifyOnSubtasks) return 'notifyOnSubtasks';
   if (prev.nodeStructureKey !== next.nodeStructureKey) return 'nodeStructureKey';
   if (prev.relativeTimeTick !== next.relativeTimeTick) return 'relativeTimeTick';
   if (getNodeSessionDirectory(prev.node) !== getNodeSessionDirectory(next.node)) return 'nodeDirectory';

@@ -18,12 +18,13 @@ or extending these scripts. The methodology rules they enforce come from
 | `bun run profile:heap` | How much JS heap and DOM the page keeps after hovering and opening N sessions. |
 | `bun run profile:composer` | What each new composer line costs in style recalculation. |
 | `bun run profile:toggle` | What opening and closing the left session sidebar and the right context panel costs, per toggle. |
+| `bun run profile:ios` | What the iOS app does on a real iPhone, over its WebKit inspector: tap to keyboard, per-frame positions through a keyboard open, the heaviest subtrees. Setup in the `performance-engineering` skill, `references/ios-webkit.md`. |
 | `bun run profile:compare` | Whether a change made the scenarios faster or slower: builds the before and the after, measures both the same way, prints one table. |
 | `bun run profile:serve` | An isolated server with the fixture provider, to run the commands above by hand. |
 | `bun run profile:analyze` | Where one run's time went: functions, source files, components, long tasks, renders. |
 | `bun run build:web:diag` | Not a capture: the diagnostic build that names functions and components (Attribution below). |
 
-All of them measure a real browser over CDP. Pass `--help` to any of them for
+All of them measure a real browser over CDP; `profile:ios` measures the phone's WebKit through the `pymobiledevice3` bridge instead, with its commands in the script's header. Pass `--help` to any of them for
 the full option list.
 
 To answer "did my change help", start with `profile:compare` (Comparing Two
@@ -250,6 +251,11 @@ One run is never a result: repeat a scenario and aggregate with
 `node scripts/perf/aggregate-runs.mjs <run directories…>`.
 `perf/code-300cps` and `perf/code-1200cps` stream one 240-line code block,
 because what a growing fence costs does not show in fences of five lines.
+`perf/showcase-20000cps` answers with one of every Markdown construct the chat
+renders (headings, lists, tasks, quotes, a table, inline and display math,
+a disclosure, a Mermaid diagram, fenced code with and without a language,
+raw HTML that must stay text). It is not a timing stimulus: open its session
+on two builds and compare screenshots when a change touches the renderer.
 `perf/think-30s` stays silent for thirty seconds and then answers in one word:
 it holds the app in its working state with nothing streaming, which is what an
 agent thinking or running a tool looks like to the UI.
@@ -258,6 +264,13 @@ each step says a line and calls the `glob` tool, OpenCode runs the tool for
 real, and after the last step the document streams. The turn on screen then
 carries twenty tool parts while the text arrives, which is the shape of a long
 agentic turn and what the cost of re-rendering a turn per delta depends on.
+Each turn counts its calls from its own prompt, so every turn of a long
+session is agentic. `agent-20reads-300cps` reads 1,500-line files instead of
+globbing (`isolated-server.mjs` writes them into the project under
+`perf-read/`), so each step carries the full output a real agent's reads do.
+`agent-100tools-x5-300cps` makes its hundred calls five at a time: twenty
+steps whose messages hold five tool parts each, the turn that windowing by
+messages left fully mounted.
 `perf/unicode-300cps` (and `unicode-1200cps`) streams prose with em dashes,
 curly quotes and whole Cyrillic paragraphs, and a 150-line TypeScript fence
 whose comments and strings carry the same characters. V8 stores a string with
@@ -271,6 +284,21 @@ session with a hundred turns of realistic history in minutes:
 ```bash
 node scripts/perf/seed-long-session.mjs --port 4599 --dir <project directory> --turns 120 --title "perf: long 120"
 ```
+
+A seeded session opens with only its last ten turns in memory, the
+cold-navigation window, so streaming into it measures a short history however
+long the session is. Someone working in one chat holds every turn since they
+opened it. `--grow <turns>` reproduces that: before recording it sends that
+many turns with the page showing the session (`--grow-model`, by default
+`agent-20tools-20000cps`, and the `agent-*-20000cps` models grow agentic
+history in about three seconds a turn), scrolling to the end after each one as
+a reader who follows the chat. The summary reports the message records held
+before and after (`historyRecordsBefore`/`After`). What scales with history is
+small on a fast machine: one agentic turn cost 4.9% of the main thread with 10
+turns held and 6.2% with 100. `--cpu-throttle <rate>` slows the page's CPU
+(`Emulation.setCPUThrottlingRate`) to approximate a slower machine; at 4 the
+same turns cost 14% and 26%, with 28 long tasks instead of 5. The `grow` and
+`grow-short` scenarios of `profile:compare` are those two, throttled.
 
 Run-to-run spread on an unchanged build is one to two points of renderer CPU,
 so a smaller difference is noise.
@@ -429,7 +457,8 @@ that is not listed.
 Clicks sidebar session rows with real mouse input and measures, per click:
 
 - `ack`: the clicked row is highlighted as active (the first visible reaction);
-- `content`: messages that were not in the DOM before are in it. They may still
+- `content`: messages that were not rendered before are rendered (a timeline kept
+  in the DOM under `display: none` counts as not rendered). They may still
   be invisible: a freshly opened timeline stays at opacity 0 while renderers
   hold their provisional first paint (`data-timeline-reveal="pending"`), then
   fades in;
@@ -582,6 +611,29 @@ The next known cost: `getLoginShellEnvSnapshot` in
 synchronously on the Electron main thread during OpenCode bootstrap, although
 Desktop already merged the same probe into `process.env`, so the user's shell
 startup is paid twice.
+
+## JSON tree layout regression
+
+`json-tree-view.browser.test.mjs` loads the real JSON view and UI stylesheet in an isolated Vite fixture. It checks a Files-height container around the 200-row virtualization boundary and at 26,000 entries, tail reachability, collapse/expand, resize, hide/show, toolbar focus, and chat's absolute height caps. Both the fixture server and Chrome's debugging port stay on loopback. It reads no application state and stops the processes it started.
+
+```bash
+node --test scripts/perf/json-tree-view.browser.test.mjs
+# When Chrome is outside the standard locations:
+OPENCHAMBER_TEST_CHROME=/path/to/chrome node --test scripts/perf/json-tree-view.browser.test.mjs
+```
+
+The test reports a skip if Chrome is unavailable. An explicit invalid Chrome path fails. This is layout correctness coverage; measure Files performance in the built app.
+
+## Quote comment popover regression
+
+`chat-quote-popover.browser.test.mjs` renders the real `ChatQuoteMarkPopover` with the UI stylesheet in an isolated Vite fixture that has its own optimizer cache, so it can run next to the JSON tree test. A short saved comment sits on a quote at the left and right edges, at 320, 390 and 1024 px, in both text directions. The test opens the editor and saves twice, and after every step it checks that the popover and its controls stay 12 px inside the viewport. Like the JSON tree test, it stays on loopback and stops what it started.
+
+```bash
+node --test scripts/perf/chat-quote-popover.browser.test.mjs
+OPENCHAMBER_TEST_CHROME=/path/to/chrome node --test scripts/perf/chat-quote-popover.browser.test.mjs
+```
+
+It skips without Chrome and fails on an explicit invalid Chrome path, the same as the JSON tree test.
 
 ## profile:heap
 
@@ -759,6 +811,7 @@ What it does, in order:
 | `stream`, `code`, `unicode`, `agent` | `profile:session` on the `-300cps` fixture (`agent`: `agent-40tools-300cps`) | a new session per run |
 | `long` | `profile:session` streaming into the 120-turn session | the streaming path at scale |
 | `quiet` | `profile:session --quiet 20` on the 120-turn session | the floor `long` stands on |
+| `grow`, `grow-short` | `profile:session --grow 100` / `--grow 10` with `agent-20reads` turns, `--cpu-throttle 4` | a chat worked in for a long time; slow, about ten minutes a run |
 | `cpu` | `profile:session --process-cpu-only --headed` | the process CPU a user sees; opens a visible window |
 | `switch` | `profile:switch` over long, short A and short B, `--cold-reload --repeat <runs>` | one invocation per round |
 | `idle` | `profile:idle`, 30 s with the long session open | |
@@ -990,26 +1043,13 @@ be a measurement, never a disabled instrument.
 
 ## Methodology Rules
 
-- **Never report an "after" without a "before" on the identical scenario and
-  build.** Rebuild the unchanged version and re-run it, however inconvenient:
-  `profile:compare` does exactly that. Expect plausible fixes to change nothing.
-- **A sampling profiler cannot explain native work.** Self time in `(program)`
-  only means the time was not in interpreted JavaScript. Use the trace
-  breakdown, which names parsing, style, layout, layerization, paint and raster.
-- **Normalise when the workload varies.** Assistant responses differ in length
-  between runs, so per-second totals are not comparable; `profile:session`
-  reports output-normalised metrics for this reason.
-- **Revert what you cannot measure.** A change that does not move its target
-  metric is unvalidated complexity, not a small win.
-- **Reproduction may need production scale you do not have.** A threshold effect
-  is invisible below its threshold. Compare the reporter's scale against yours
-  on the dimension the code keys on before concluding a bug is absent.
+The measurement rules are in `.agents/skills/performance-engineering/SKILL.md`, *Workflow* steps 0 and 1. This tooling encodes two of them: `profile:compare` reruns the unchanged build for every before/after, and `profile:session` reports output-normalised metrics because response lengths vary between runs.
 
 ## Module Layout
 
 | File | Responsibility |
 |---|---|
-| `cdp.mjs` | Chrome launch, target discovery, minimal CDP client. Owns the anti-throttling launch flags and the per-run temporary Chrome profile (`resolveProfileDir`); `profile:browser` alone keeps a reusable profile, for a manually driven session. |
+| `cdp.mjs` | Chrome launch, target discovery, minimal CDP client. Owns the anti-throttling launch flags and the per-run temporary Chrome profile (`resolveProfileDir`, which also removes the `openchamber-perf-*` profiles earlier runs left: those whose `SingletonLock` symlink names a dead process); `profile:browser` alone keeps a reusable profile, for a manually driven session. |
 | `metrics.mjs` | Metric derivations shared by the profilers: growth rates, percentiles, long-task, frame-budget, windowed longest-task, trace-event and per-thread summaries. |
 | `process-cpu.mjs` | CPU per process from cumulative counters: Chrome through browser-level `SystemInfo`, the server and its OpenCode child through `ps`. Unresolved processes are reported as missing, never as zero. |
 | `fixture-provider.mjs` | Deterministic OpenAI-compatible provider: one fixed document at a rate chosen by model name. |

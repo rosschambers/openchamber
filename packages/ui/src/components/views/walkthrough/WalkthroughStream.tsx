@@ -3,14 +3,19 @@ import { Icon } from '@/components/icon/Icon';
 import { FileTypeIcon } from '@/components/icons/FileTypeIcon';
 import { ChangedPathLabel } from '@/components/views/git/ChangedPathLabel';
 import { Button } from '@/components/ui/button';
+import { ScrollableOverlay } from '@/components/ui/ScrollableOverlay';
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip';
-import { useI18n } from '@/lib/i18n';
+import { useI18n, type I18nKey } from '@/lib/i18n';
 import { groupHunksByFile } from '@/lib/walkthrough/model';
 import type { WalkthroughStopView, WalkthroughView } from '@/lib/walkthrough/model';
-import type { WalkthroughHunk, WalkthroughStopImportance } from '@/lib/walkthrough/types';
+import type { WalkthroughHunk, WalkthroughObservationKind, WalkthroughStopImportance } from '@/lib/walkthrough/types';
+import type { DiffCommentOrigin } from '@/lib/diffCommentOrigin';
+import { useWholeFileComment, WholeFileCommentButton } from '@/components/comments';
 import { cn } from '@/lib/utils';
 import { WalkthroughHunkRun } from './WalkthroughHunkRun';
+import { findRunKey, UNCOVERED_STOP_ID } from './walkthroughFind';
 import { stopElementId } from './stopElementId';
+import type { DiffFindWordRequest, PierreDiffViewerHandle } from '@/components/views/PierreDiffViewer';
 
 interface WalkthroughStreamProps {
   view: WalkthroughView;
@@ -20,8 +25,16 @@ interface WalkthroughStreamProps {
   onScrollHandled: () => void;
   renderSideBySide: boolean;
   wrapLines: boolean;
+  /** The diff the walkthrough reads, for comments; absent for uncommitted changes. */
+  commentOrigin?: DiffCommentOrigin;
   /** What the change is about, shown above the first step when the contents column is hidden. */
   summary?: string;
+  /** Find-in-walkthrough: opens the uncovered tail each time it moves past 0. */
+  uncoveredOpenRequest?: number;
+  /** Find-in-walkthrough: register each stop run's rendered viewer handle. */
+  registerFindViewerRef?: (runKey: string, handle: PierreDiffViewerHandle | null) => void;
+  /** Find-in-walkthrough: a modifier-click on a word, tagged with its run. */
+  onFindWordRequest?: (runKey: string, request: DiffFindWordRequest) => void;
 }
 
 // How long a jump holds its target in place while the diffs above it mount.
@@ -37,6 +50,25 @@ const IMPORTANCE_CLASS: Record<WalkthroughStopImportance, string> = {
   normal: 'oc-tile-inset text-muted-foreground',
   context: 'oc-tile-inset text-muted-foreground',
 };
+
+// Observations sit apart from the prose so the explanation stays neutral. They
+// are facts the reader agrees to, not findings, so they take no status colour
+// either: a neutral pill names the kind and its tooltip says what that means.
+const OBSERVATION_LABEL_KEY = {
+  decision: 'walkthrough.observation.decision',
+  cost: 'walkthrough.observation.cost',
+  limitation: 'walkthrough.observation.limitation',
+  asymmetry: 'walkthrough.observation.asymmetry',
+  unproven: 'walkthrough.observation.unproven',
+} as const satisfies Record<WalkthroughObservationKind, I18nKey>;
+
+const OBSERVATION_HINT_KEY = {
+  decision: 'walkthrough.observation.decisionHint',
+  cost: 'walkthrough.observation.costHint',
+  limitation: 'walkthrough.observation.limitationHint',
+  asymmetry: 'walkthrough.observation.asymmetryHint',
+  unproven: 'walkthrough.observation.unprovenHint',
+} as const satisfies Record<WalkthroughObservationKind, I18nKey>;
 
 const StopHeader = ({ stopView }: { stopView: WalkthroughStopView }) => {
   const { t } = useI18n();
@@ -72,6 +104,23 @@ const StopHeader = ({ stopView }: { stopView: WalkthroughStopView }) => {
         )}
       </div>
       <p className="typography-ui-label text-muted-foreground">{stop.prose}</p>
+      {stop.observations && stop.observations.length > 0 && (
+        <ul className="oc-tile flex flex-col gap-1.5 rounded-lg px-3 py-2">
+          {stop.observations.map((observation) => (
+            <li key={`${observation.kind}:${observation.note}`} className="typography-ui-label text-foreground">
+              <Tooltip>
+                <TooltipTrigger className="oc-tile-inset typography-micro me-1.5 inline-flex h-5 items-center whitespace-nowrap rounded px-1.5 align-[0.1em] leading-none text-muted-foreground">
+                  {t(OBSERVATION_LABEL_KEY[observation.kind])}
+                </TooltipTrigger>
+                <TooltipContent className="max-w-64">
+                  <p className="typography-micro leading-tight">{t(OBSERVATION_HINT_KEY[observation.kind])}</p>
+                </TooltipContent>
+              </Tooltip>
+              {observation.note}
+            </li>
+          ))}
+        </ul>
+      )}
       {stopView.isStale && (
         <p className="typography-meta flex items-center gap-1.5 text-status-warning">
           <Icon name="error-warning" className="size-3.5 shrink-0" />
@@ -89,21 +138,42 @@ const StopHeader = ({ stopView }: { stopView: WalkthroughStopView }) => {
  * hunks — the path is the main orientation cue in a long stream, and as a plain
  * caption it was easy to scroll straight past.
  */
-const FileHeader = ({ path }: { path: string }) => (
-  <div className="sticky top-0 z-10 flex items-center gap-1.5 border-b border-[var(--interactive-border)]/35 bg-[var(--surface-elevated)]/90 px-4 py-1.5 backdrop-blur-md supports-[backdrop-filter]:bg-[var(--surface-elevated)]/80">
-    <FileTypeIcon filePath={path} className="size-3.5 shrink-0" />
-    <ChangedPathLabel path={path} className="typography-meta font-mono" />
-  </div>
-);
+const FileHeader = ({ path, commentOrigin }: { path: string; commentOrigin?: DiffCommentOrigin }) => {
+  const wholeFileComment = useWholeFileComment({ fileLabel: path, origin: commentOrigin });
+  return (
+    <>
+      <div className="sticky top-0 z-10 border-b border-[var(--interactive-border)]/35 bg-[var(--surface-elevated)]/90 backdrop-blur-md supports-[backdrop-filter]:bg-[var(--surface-elevated)]/80">
+        <div className="flex items-center gap-1.5 px-4 py-1.5">
+          <FileTypeIcon filePath={path} className="size-3.5 shrink-0" />
+          <ChangedPathLabel path={path} className="typography-meta min-w-0 flex-1 font-mono" />
+          <WholeFileCommentButton
+            onClick={wholeFileComment.toggle}
+            active={wholeFileComment.isOpen}
+          />
+        </div>
+        {wholeFileComment.editor}
+      </div>
+      {wholeFileComment.cards}
+    </>
+  );
+};
 
 const HunkRuns = ({
+  stopId,
   hunks,
   renderSideBySide,
   wrapLines,
+  commentOrigin,
+  registerFindViewerRef,
+  onFindWordRequest,
 }: {
+  stopId: string;
   hunks: WalkthroughHunk[];
   renderSideBySide: boolean;
   wrapLines: boolean;
+  commentOrigin?: DiffCommentOrigin;
+  registerFindViewerRef?: (runKey: string, handle: PierreDiffViewerHandle | null) => void;
+  onFindWordRequest?: (runKey: string, request: DiffFindWordRequest) => void;
 }) => {
   const runs = useMemo(() => groupHunksByFile(hunks), [hunks]);
 
@@ -111,12 +181,16 @@ const HunkRuns = ({
     <>
       {runs.map((run, index) => (
         <div key={`${run.path}-${index}`}>
-          <FileHeader path={run.path} />
+          <FileHeader path={run.path} commentOrigin={commentOrigin} />
           <WalkthroughHunkRun
             path={run.path}
             hunks={run.hunks}
             renderSideBySide={renderSideBySide}
             wrapLines={wrapLines}
+            commentOrigin={commentOrigin}
+            runKey={findRunKey(stopId, index, run.hunks)}
+            registerFindViewerRef={registerFindViewerRef}
+            onFindWordRequest={onFindWordRequest}
           />
         </div>
       ))}
@@ -137,10 +211,14 @@ export const WalkthroughStream = memo(function WalkthroughStream({
   onScrollHandled,
   renderSideBySide,
   wrapLines,
+  commentOrigin,
   summary,
+  uncoveredOpenRequest = 0,
+  registerFindViewerRef,
+  onFindWordRequest,
 }: WalkthroughStreamProps) {
   const { t } = useI18n();
-  const scrollRef = useRef<HTMLDivElement | null>(null);
+  const scrollRef = useRef<HTMLElement | null>(null);
   const [uncoveredOpen, setUncoveredOpen] = useState(false);
 
   // Set while a click-driven jump is in flight. Without it the observer reports
@@ -149,6 +227,12 @@ export const WalkthroughStream = memo(function WalkthroughStream({
   // sidebar showing step 5 while the stream shows step 6.
   const navigatingRef = useRef<string | null>(null);
   const releaseJumpRef = useRef<(() => void) | null>(null);
+
+  // A find match in the uncovered tail has to open it first: its runs are not
+  // mounted while collapsed, so there would be no viewer to scroll inside.
+  useEffect(() => {
+    if (uncoveredOpenRequest > 0) setUncoveredOpen(true);
+  }, [uncoveredOpenRequest]);
 
   useEffect(() => () => releaseJumpRef.current?.(), []);
 
@@ -228,13 +312,19 @@ export const WalkthroughStream = memo(function WalkthroughStream({
   }, [handleIntersection, view.stops]);
 
   const uncoveredRuns = useMemo(() => groupHunksByFile(view.uncoveredHunks), [view.uncoveredHunks]);
+  // The model's line on why a left-out file needs no stop, shown once per file.
+  const routineNotes = useMemo(
+    () => new Map((view.walkthrough.routine ?? []).map((entry) => [entry.path, entry.note])),
+    [view.walkthrough.routine],
+  );
 
   return (
-    <div
+    <ScrollableOverlay
       ref={scrollRef}
-      className="min-h-0 flex-1 overflow-y-auto"
+      outerClassName="min-h-0 flex-1"
       data-diff-virtual-root
       data-diff-virtual-content
+      disableHorizontal
     >
       {summary && (
         <p className="typography-ui-label px-4 pt-4 text-muted-foreground">{summary}</p>
@@ -245,16 +335,20 @@ export const WalkthroughStream = memo(function WalkthroughStream({
           id={stopElementId(stopView.stop.id)}
           data-stop-id={stopView.stop.id}
           className={cn(
-            'border-b border-border/60',
+            'border-b border-edge',
             activeStopId === stopView.stop.id && 'bg-interactive-selection/5'
           )}
         >
           <StopHeader stopView={stopView} />
           {stopView.hunks.length > 0 ? (
             <HunkRuns
+              stopId={stopView.stop.id}
               hunks={stopView.hunks}
               renderSideBySide={renderSideBySide}
               wrapLines={wrapLines}
+              commentOrigin={commentOrigin}
+              registerFindViewerRef={registerFindViewerRef}
+              onFindWordRequest={onFindWordRequest}
             />
           ) : (
             <p className="typography-meta px-4 pb-4 text-muted-foreground">
@@ -265,7 +359,7 @@ export const WalkthroughStream = memo(function WalkthroughStream({
       ))}
 
       {view.uncoveredHunks.length > 0 && (
-        <section className="border-b border-border/60">
+        <section className="border-b border-edge">
           <Button
             type="button"
             variant="ghost"
@@ -286,17 +380,24 @@ export const WalkthroughStream = memo(function WalkthroughStream({
           {uncoveredOpen
             && uncoveredRuns.map((run, index) => (
               <div key={`${run.path}-${index}`}>
-                <FileHeader path={run.path} />
+                <FileHeader path={run.path} commentOrigin={commentOrigin} />
+                {routineNotes.has(run.path) && uncoveredRuns.findIndex((other) => other.path === run.path) === index && (
+                  <p className="typography-meta px-4 py-1.5 text-muted-foreground">{routineNotes.get(run.path)}</p>
+                )}
                 <WalkthroughHunkRun
                   path={run.path}
                   hunks={run.hunks}
                   renderSideBySide={renderSideBySide}
                   wrapLines={wrapLines}
+                  commentOrigin={commentOrigin}
+                  runKey={findRunKey(UNCOVERED_STOP_ID, index, run.hunks)}
+                  registerFindViewerRef={registerFindViewerRef}
+                  onFindWordRequest={onFindWordRequest}
                 />
               </div>
             ))}
         </section>
       )}
-    </div>
+    </ScrollableOverlay>
   );
 });

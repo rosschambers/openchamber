@@ -7,11 +7,11 @@ import { devtools, persist } from "zustand/middleware";
 import { findCatalogModel, type Provider, type Model, type Agent, type Config } from "@/lib/opencode/model";
 import type { DesktopSettings } from "@/lib/desktop";
 import type { CatalogKind } from "@/lib/opencode/events";
-import { opencodeClient, type OpencodeHealthProbe } from "@/lib/opencode/client";
+import { OpencodeApiError, opencodeClient, type OpencodeHealthProbe } from "@/lib/opencode/client";
 import { isSameProjectConfigError, readProjectConfigError, type ProjectConfigError } from "@/lib/opencode/configError";
 import { scopeMatches, subscribeToConfigChanges } from "@/lib/configSync";
 import type { ModelMetadata } from "@/types";
-import { createDeferredSafeJSONStorage } from "./utils/safeStorage";
+import { createDeferredSafeJSONStorage, getSafeStorage } from "./utils/safeStorage";
 import { filterVisibleAgents, isAgentHidden } from "./useAgentsStore";
 import { isPrimaryMode } from "@/components/chat/mobileControlsUtils";
 import { useSessionUIStore } from "@/sync/session-ui-store";
@@ -21,8 +21,10 @@ import { loadDesktopSettings, updateDesktopSettings } from "@/lib/persistence";
 import { useDirectoryStore } from "@/stores/useDirectoryStore";
 import { useProjectsStore } from "@/stores/useProjectsStore";
 import { resolveProjectForSessionDirectory } from "@/lib/projectResolution";
+import { isSpaceDirectory } from "@/lib/spaces/space-route";
 import { streamDebugEnabled } from "@/stores/utils/streamDebug";
 import { parseModelIdentifier, parseModelSelection } from "@/lib/modelIdentifier";
+import { readRememberedEffort, rememberEffort, resolveEffortChoice, type EffortChoice } from "@/lib/modelEfforts";
 import type { ModelRef } from "@/lib/settings/parsers";
 import { configModelIdentifier } from "@/lib/opencode/projection";
 import { runtimeFetch } from "@/lib/runtime-fetch";
@@ -31,7 +33,7 @@ import { markStartupTrace, measureStartupTrace } from "@/lib/startupTrace";
 import { normalizePath } from "@/lib/pathNormalization";
 import { getSyncConfig, subscribeToSyncConfigChanges } from "@/sync/sync-refs";
 import { getRuntimeKey, subscribeRuntimeEndpointChanged } from "@/lib/runtime-switch";
-import { readCachedCatalog, shouldHoldFirstLoadAgainstCache, writeCachedCatalogWhenSettled, type CachedCatalog } from "./configCatalogCache";
+import { readCachedCatalog, writeCachedCatalogWhenSettled, type CachedCatalog } from "./configCatalogCache";
 
 const MODELS_DEV_API_URL = "https://models.dev/api.json";
 const MODELS_DEV_PROXY_URL = "/api/openchamber/models-metadata";
@@ -45,6 +47,7 @@ const ADD_PROVIDER_SENTINEL = "__add_provider__";
 const GIT_UTILITY_PROVIDER_ID = "zen";
 const GIT_UTILITY_PREFERRED_MODEL_ID = "big-pickle";
 const PROVIDER_CONFIG_REFRESH_CONCURRENCY = 4;
+
 const PROVIDERS_RETRY_SOURCE = "loadProviders:retryAfterFailure";
 const PROVIDERS_RETRY_DELAY_MS = 3000;
 
@@ -58,11 +61,14 @@ interface OpenChamberDefaults {
     zenModel?: string;
     messageStreamTransport?: 'auto' | 'ws' | 'sse';
     dictationEnabled?: boolean;
+    dictationAutoSend?: boolean;
     sttProvider?: 'local' | 'openai-compatible';
     sttServerUrl?: string;
+    sttEndpointPath?: string;
     sttModel?: string;
     sttLocalModel?: string;
     sttLanguage?: string;
+    sttCorrectTranscript?: boolean;
 }
 
 // Directory activation re-reads the OpenChamber defaults, which are global,
@@ -72,6 +78,8 @@ const OPENCHAMBER_DEFAULTS_FRESH_MS = 15_000;
 type ConfigRuntimeContext = { runtimeKey: string; generation: number };
 
 let configRuntimeGeneration = 0;
+// A transport change retires in-flight reads but keeps delayed same-instance discovery.
+let configInstanceGeneration = 0;
 
 const captureConfigRuntimeContext = (): ConfigRuntimeContext => ({
     runtimeKey: getRuntimeKey(),
@@ -142,11 +150,14 @@ const toOpenChamberDefaults = (data: DesktopSettings): OpenChamberDefaults => {
         zenModel: zenModel.length > 0 ? zenModel : undefined,
         messageStreamTransport: data.messageStreamTransport,
         dictationEnabled: data.dictationEnabled,
+        dictationAutoSend: data.dictationAutoSend,
         sttProvider: data.sttProvider,
         sttServerUrl: data.sttServerUrl,
+        sttEndpointPath: data.sttEndpointPath,
         sttModel: data.sttModel,
         sttLocalModel: data.sttLocalModel,
         sttLanguage: data.sttLanguage,
+        sttCorrectTranscript: data.sttCorrectTranscript,
     };
 };
 
@@ -194,7 +205,7 @@ type ProviderModel = Model;
 type ProviderWithModelList = Provider & { models: Model[] };
 
 type GitModelSelection = { providerId: string; modelId: string };
-type ProviderModelSelection = { providerId: string; modelId: string; variant?: string } | null;
+type ProviderModelSelection = { providerId: string; modelId: string; variant?: string | null } | null;
 
 const sanitizePersistedSelectedProviderId = (providerId: string | undefined): string => (
     providerId === ADD_PROVIDER_SENTINEL ? "" : (providerId ?? "")
@@ -220,6 +231,25 @@ const findProviderModel = (
 const modelHasVariant = (model: Model | undefined, variant: string | null | undefined): boolean => (
     typeof variant === "string" && listModelVariantIds(model?.variants).includes(variant)
 );
+
+/**
+ * The level this model was last sent with, when the model still offers it.
+ * `null` is an explicit Default. A remembered name the model no longer offers
+ * is ignored instead of becoming a choice, and a model the catalog does not
+ * list is left alone rather than guessed at.
+ */
+const resolveRememberedVariantForModel = (
+    providers: ProviderWithModelList[],
+    providerId: string | undefined,
+    modelId: string | undefined,
+): EffortChoice => {
+    if (!providerId || !modelId) return undefined;
+    const model = findProviderModel(providers, providerId, modelId);
+    if (!model) return undefined;
+    const variants = modelVariantNames(model);
+    if (variants.length === 0) return undefined;
+    return resolveEffortChoice([readRememberedEffort(providerId, modelId)], variants);
+};
 
 const hasProviderModel = (
     providers: ProviderWithModelList[],
@@ -282,31 +312,46 @@ const resolveProviderModelSelection = ({
 
         return modelHasVariant(findProviderModel(providers, providerId, modelId), variant) ? variant : undefined;
     };
+    const resolveVariantOrRemembered = (
+        providerId: string,
+        modelId: string,
+        variant?: string,
+    ): string | null | undefined => (
+        resolveVariant(providerId, modelId, variant)
+        ?? resolveRememberedVariantForModel(providers, providerId, modelId)
+    );
 
     const preserveManual = preserveCurrent && !isStaleAutoSelection(currentProviderId, currentModelId);
     if (currentProviderId && currentModelId && (preserveManual || hasProviderModel(providers, currentProviderId, currentModelId))) {
         return {
             providerId: currentProviderId,
             modelId: currentModelId,
-            variant: preserveCurrent ? currentVariant : resolveVariant(currentProviderId, currentModelId, currentVariant),
+            variant: preserveCurrent
+                ? currentVariant
+                : resolveVariantOrRemembered(currentProviderId, currentModelId, currentVariant),
         };
     }
 
     if (settingsDefaultModel) {
         const parsed = parseModelString(settingsDefaultModel);
-        if (parsed) {
+        if (parsed && !isStaleAutoSelection(parsed.providerId, parsed.modelId)) {
             return {
                 providerId: parsed.providerId,
                 modelId: parsed.modelId,
                 variant: hasProviderModel(providers, parsed.providerId, parsed.modelId)
-                    ? resolveVariant(parsed.providerId, parsed.modelId, settingsDefaultVariant)
+                    ? resolveVariantOrRemembered(parsed.providerId, parsed.modelId, settingsDefaultVariant)
                     : settingsDefaultVariant,
             };
         }
     }
 
     if (!allowFallback) return null;
-    return resolveLastSelectedModel(fallbackPrefs) ?? resolveFallbackModel(providers, fallbackPrefs.hiddenModels);
+    const fallback = resolveLastSelectedModel(fallbackPrefs) ?? resolveFallbackModel(providers, fallbackPrefs.hiddenModels);
+    if (!fallback) return null;
+    return {
+        ...fallback,
+        variant: resolveRememberedVariantForModel(providers, fallback.providerId, fallback.modelId),
+    };
 };
 
 /** What the automatic pick reads from the user's model preferences. */
@@ -374,7 +419,16 @@ type DefaultAgentModelSelection = {
     agentName: string | undefined;
     providerId?: string;
     modelId?: string;
-    variant?: string;
+    /** `null` is an explicit Default remembered for that model. */
+    variant?: string | null;
+};
+
+/** `agentName` is unset when the directory's agents could not be read: OpenCode then picks its own default there. */
+type DirectoryDefaultSelection = {
+    agentName: string | undefined;
+    providerId: string;
+    modelId: string;
+    variant?: string | null;
 };
 
 // Shared default-selection cascade used both at startup (loadAgents) and when opening a
@@ -424,7 +478,6 @@ const resolveDefaultAgentModelSelection = ({
         }
         return modelHasVariant(findProviderModel(providers, providerId, modelId), variant) ? variant : undefined;
     };
-
     // --- Agent cascade ---
     const primaryAgents = agents.filter((agent) => isPrimaryMode(agent.mode) && !isAgentHidden(agent));
 
@@ -445,16 +498,31 @@ const resolveDefaultAgentModelSelection = ({
     if (!resolvedAgent) {
         resolvedAgent = primaryAgents.find((agent) => agent.name === "build") || primaryAgents[0] || agents[0];
     }
+
+    // With nothing configured for the model: the resolved agent's own pin (if
+    // it pins this model), then the level the model was last sent with.
+    const resolveAgentOrRememberedVariant = (): string | null | undefined => {
+        if (!providerId || !modelId) return undefined;
+        const model = findProviderModel(providers, providerId, modelId);
+        if (!model) return undefined;
+        const variants = modelVariantNames(model);
+        if (variants.length === 0) return undefined;
+        const agentVariant = resolvedAgent?.model?.providerID === providerId && resolvedAgent.model.id === modelId
+            ? resolvedAgent.model.variant
+            : undefined;
+        return resolveEffortChoice([agentVariant, readRememberedEffort(providerId, modelId)], variants);
+    };
+
     // --- Model cascade ---
     let providerId: string | undefined;
     let modelId: string | undefined;
-    let variant: string | undefined;
+    let variant: string | null | undefined;
 
     const effectiveDefaultModel = projectDefaultModel || settingsDefaultModel;
 
     if (effectiveDefaultModel) {
         const parsed = parseModelString(effectiveDefaultModel);
-        if (parsed) {
+        if (parsed && !isStaleAutoSelection(parsed.providerId, parsed.modelId)) {
             providerId = parsed.providerId;
             modelId = parsed.modelId;
             // A project default carries its own variant; the settings variant
@@ -467,6 +535,9 @@ const resolveDefaultAgentModelSelection = ({
     }
 
     if (providerId || !allowFallback) {
+        if (variant === undefined) {
+            variant = resolveAgentOrRememberedVariant();
+        }
         return { agentName: resolvedAgent?.name ?? projectDefaultAgent ?? settingsDefaultAgent, providerId, modelId, variant };
     }
 
@@ -496,6 +567,12 @@ const resolveDefaultAgentModelSelection = ({
         const fallback = resolveLastSelectedModel(fallbackPrefs) ?? resolveFallbackModel(providers, fallbackPrefs.hiddenModels);
         providerId = fallback?.providerId;
         modelId = fallback?.modelId;
+    }
+
+    // Nothing configured names a level for this model: its last sent level,
+    // if the model still offers it, is what a new session starts on.
+    if (variant === undefined) {
+        variant = resolveAgentOrRememberedVariant();
     }
 
     return { agentName: resolvedAgent?.name, providerId, modelId, variant };
@@ -608,6 +685,14 @@ const buildModelMetadataKey = (providerId: string, modelId: string) => {
     return `${normalizedProvider}/${modelId}`;
 };
 
+const runtimeModelReleaseDate = (released: number | undefined): string | undefined => {
+    if (released === undefined || !Number.isFinite(released) || released <= 0) return undefined;
+    const date = new Date(released);
+    if (!Number.isFinite(date.getTime())) return undefined;
+    const iso = date.toISOString();
+    return /^\d{4}-/.test(iso) ? iso.slice(0, 10) : undefined;
+};
+
 /**
  * Fallback metadata for models models.dev does not list (custom providers,
  * proxies). v2 prices a model per context tier; the untiered entry is the base
@@ -623,7 +708,8 @@ const deriveModelMetadata = (providerId: string, model: ProviderModel): ModelMet
     const hasReasoningSignal = modelVariantNames(model).length > 0
         || model.compatibility?.reasoningField !== undefined
         || model.compatibility?.requireReasoning === true;
-    return {
+    const releaseDate = runtimeModelReleaseDate(model.time?.released);
+    const metadata: ModelMetadata = {
         id: model.modelID,
         providerId,
         name: model.name,
@@ -642,6 +728,29 @@ const deriveModelMetadata = (providerId: string, model: ProviderModel): ModelMet
         } : undefined,
         limit: { context: model.limit.context, output: model.limit.output },
     };
+    if (releaseDate) metadata.release_date = releaseDate;
+    return metadata;
+};
+
+const findDescriptiveMetadata = (
+    metadata: ReadonlyMap<string, ModelMetadata>,
+    model: ProviderModel,
+    providerCanonical: string | undefined,
+): ModelMetadata | undefined => {
+    if (!model.modelID) return undefined;
+    const canonical = normalizeOptionalString(model.canonical)
+        ?? normalizeOptionalString(providerCanonical);
+    if (canonical) {
+        return metadata.get(buildModelMetadataKey(canonical, model.modelID));
+    }
+    let match: ModelMetadata | undefined;
+    for (const [key, entry] of metadata) {
+        const separator = key.indexOf('/');
+        if (separator < 0 || key.slice(separator + 1) !== model.modelID) continue;
+        if (match) return undefined;
+        match = entry;
+    }
+    return match;
 };
 
 const transformModelsDevResponse = (payload: unknown): Map<string, ModelMetadata> => {
@@ -942,7 +1051,9 @@ const getFallbackProjectDirectory = (): string | null => {
     }
 };
 
-const getProjectDefaultsForConfigDirectory = (directory: string | null | undefined) => {
+type ProjectDefaults = { projectDefaultAgent?: string; projectDefaultModel?: string; projectDefaultVariant?: string };
+
+const getProjectDefaultsForConfigDirectory = (directory: string | null | undefined): ProjectDefaults => {
     const configDirectory = normalizeConfigPath(directory);
     if (!configDirectory) {
         return {};
@@ -950,6 +1061,10 @@ const getProjectDefaultsForConfigDirectory = (directory: string | null | undefin
     const session = useSessionUIStore.getState();
     if (!session.currentSessionId && session.newSessionDraft?.open && session.newSessionDraft.target === 'chat'
         && toDirectoryKey(configDirectory) === useConfigStore.getState().activeDirectoryKey) return {};
+    return readProjectDefaults(configDirectory);
+};
+
+const readProjectDefaults = (configDirectory: string): ProjectDefaults => {
     const projectDirectory = resolveProjectDirectory(configDirectory);
     const project = useProjectsStore.getState().projects.find((entry) => normalizeConfigPath(entry.path) === projectDirectory);
     return {
@@ -959,11 +1074,39 @@ const getProjectDefaultsForConfigDirectory = (directory: string | null | undefin
     };
 };
 
+/**
+ * The effort configured next to a default model applies to that model only:
+ * the project's for the project model, the settings one for the settings
+ * model. Any other model starts on its own default, so an effort chosen for
+ * one model never follows the user onto the next.
+ */
+const resolveConfiguredDefaultVariant = (
+    defaults: {
+        projectDefaultModel?: string;
+        projectDefaultVariant?: string;
+        settingsDefaultModel?: string;
+        settingsDefaultVariant?: string;
+    },
+    providerId: string,
+    modelId: string,
+): string | undefined => {
+    const isThisModel = (model: string | undefined) => {
+        const parsed = model ? parseModelString(model) : null;
+        return parsed?.providerId === providerId && parsed.modelId === modelId;
+    };
+    if (isThisModel(defaults.projectDefaultModel)) return defaults.projectDefaultVariant;
+    if (isThisModel(defaults.settingsDefaultModel)) return defaults.settingsDefaultVariant;
+    return undefined;
+};
+
 const resolveProjectDirectory = (directory: string | null | undefined): string | null => {
     const dir = normalizeConfigPath(directory);
     const projects = getKnownProjectDirectories();
     if (!dir) return null;
     if (projects.includes(dir)) return dir;
+    // A space's sessions take their models from what the space was given, never from the host
+    // project's defaults, so its directory maps to no project here (see `space-catalog-sync.ts`).
+    if (isSpaceDirectory(dir)) return null;
 
     // 1. Persisted mapping — resolves synchronously when the async worktree
     //    discovery has not populated the runtime map yet.
@@ -999,9 +1142,7 @@ const CONFIG_REFRESH_TTL_MS = 30_000;
 
 // OpenCode announces a rebuilt catalog for the directory it rebuilt, and only
 // the active directory is re-read at once. Any other directory is marked stale
-// so returning to it re-reads instead of trusting its snapshot: a worktree left
-// while OpenCode was still starting it holds a provider list from before its
-// plugin providers registered. A load that began before the mark must not make
+// so returning to it re-reads instead of trusting its snapshot. A load that began before the mark must not make
 // the directory fresh again, so marks carry a revision and loads capture one.
 const ALL_DIRECTORIES = '*';
 let _catalogRevision = 0;
@@ -1050,52 +1191,18 @@ const getConfigLoadKey = (context: ConfigRuntimeContext, directoryKey: string): 
     JSON.stringify([context.generation, context.runtimeKey, directoryKey])
 );
 
-// Catalogs shown from the persisted cache (configCatalogCache.ts), by load key,
-// with the entry count they showed: providers count their models. The first
-// live load of such a directory is checked against that count; see
-// `shouldHoldFirstLoadAgainstCache`.
-const _providersShownFromCache = new Map<string, number>();
-const _agentsShownFromCache = new Map<string, number>();
-// A location OpenCode is still starting completes its catalog about two
-// seconds after the first, partial answer.
-const CATALOG_CACHE_RECHECK_MS = 2_500;
-const CATALOG_CACHE_RECHECK_SOURCE = 'catalogCacheRecheck';
-
-const countCatalogModels = (providers: readonly ProviderWithModelList[]): number =>
-    providers.reduce((count, provider) => count + provider.models.length, 0);
-
 /**
- * True when a first live catalog for a directory shown from the cache is
- * smaller than the cache. The caller keeps the cached catalog on screen and
- * re-reads once; that re-read is applied whatever it holds.
- */
-const holdFirstLoadAgainstCache = (shownFromCache: Map<string, number>, loadKey: string, loadedCount: number): boolean => {
-    const cachedCount = shownFromCache.get(loadKey);
-    if (cachedCount === undefined) return false;
-    shownFromCache.delete(loadKey);
-    return shouldHoldFirstLoadAgainstCache(cachedCount, loadedCount);
-};
-
-/**
- * Persists a catalog a live load applied, once it has settled. A location
- * OpenCode is still starting answers partial first (no plugin providers or
- * agents) and announces the full catalog with catalog events about two seconds
- * later; a load such an event superseded is never stored, the re-read the event
- * triggers is. An empty catalog is stored only by the re-read after a held
- * first load: a cold location answers empty before it has started, and that
- * answer must not erase a good cached catalog.
+ * Persists a catalog a live load applied, once it has settled. A load a later
+ * catalog event superseded is never stored; the re-read the event triggers is.
  */
 const persistLoadedCatalog = (
     context: ConfigRuntimeContext,
     directoryKey: string,
-    source: string,
     update: CachedCatalog,
-    isEmpty: boolean,
     staleAt: Map<string, number>,
     loadRevision: number,
 ): void => {
     if (directoryKey === DIRECTORY_KEY_GLOBAL) return;
-    if (isEmpty && source !== CATALOG_CACHE_RECHECK_SOURCE) return;
     writeCachedCatalogWhenSettled(
         context.runtimeKey,
         directoryKey,
@@ -1115,7 +1222,6 @@ const hydrateConfigCatalogFromCache = async (directoryKey: string): Promise<void
     const context = captureConfigRuntimeContext();
     const cached = await readCachedCatalog(context.runtimeKey, directoryKey);
     if (!cached || !isConfigRuntimeContextCurrent(context)) return;
-    const loadKey = getConfigLoadKey(context, directoryKey);
     useConfigStore.setState((state) => {
         const snapshot = state.directoryScoped[directoryKey] ?? createEmptyDirectoryScopedConfig();
         const isActive = state.activeDirectoryKey === directoryKey;
@@ -1126,8 +1232,6 @@ const hydrateConfigCatalogFromCache = async (directoryKey: string): Promise<void
         const providers = !providersLive && cached.providers?.length ? cached.providers : null;
         const agents = !agentsLive && cached.agents?.length ? cached.agents : null;
         if (!providers && !agents) return state;
-        if (providers) _providersShownFromCache.set(loadKey, countCatalogModels(providers));
-        if (agents) _agentsShownFromCache.set(loadKey, agents.length);
         markStartupTrace('configCatalogCache:hydrated', { directoryKey, providers: providers?.length ?? 0, agents: agents?.length ?? 0 });
         const defaultProviders = providers && cached.defaultProviders ? cached.defaultProviders : snapshot.defaultProviders;
         const nextSnapshot: DirectoryScopedConfig = {
@@ -1143,9 +1247,16 @@ const hydrateConfigCatalogFromCache = async (directoryKey: string): Promise<void
     });
 };
 
-// Last agent-load error text per config-directory key, read by initializeApp
-// to explain a startup failure. Cleared when that directory loads again.
-const _agentsLoadErrors = new Map<string, string>();
+// Last agent-load error per config-directory key, read by initializeApp to
+// explain a startup failure. Cleared when that directory loads again.
+const _agentsLoadErrors = new Map<string, Error>();
+
+// OpenCode cannot open the directory at all (deleted, or a path it cannot
+// resolve). Retrying gives the same answer, and startup treats the project like
+// one whose folder is gone.
+const isLocationNotFound = (error: Error | undefined): boolean => (
+    error instanceof OpencodeApiError && error.tag === 'LocationNotFoundError'
+);
 
 const clearProjectConfigError = (directoryKey: string): void => {
     if (!useConfigStore.getState().projectConfigErrors[directoryKey]) return;
@@ -1164,18 +1275,18 @@ subscribeRuntimeEndpointChanged((detail) => {
     _providersStaleAt.clear();
     _agentsStaleAt.clear();
     _agentsLoadErrors.clear();
-    _providersShownFromCache.clear();
-    _agentsShownFromCache.clear();
     _inFlightProviders.clear();
     _inFlightAgents.clear();
     _agentsLoadGeneration.clear();
     _initializeAppInFlight = null;
     if (detail.runtimeKey === detail.previousRuntimeKey) return;
+    configInstanceGeneration += 1;
     useConfigStore.setState({
         configRuntimeKey: detail.runtimeKey,
         directoryScoped: {},
         projectConfigErrors: {},
         lastInitFailure: null,
+        imageOnlyProviders: {},
         providers: [],
         agents: [],
         providersLoaded: false,
@@ -1242,15 +1353,21 @@ interface DirectoryScopedConfig {
  * "Default" entry unpickable, because the settings default silently takes
  * effect again and the next assistant reply echoes it back as an explicit
  * choice.
+ *
+ * `inherited: null` means the inherited choice is a remembered explicit
+ * Default. Like the override, it sends no effort but must not be mistaken for
+ * "nothing inherited" when a lower-priority source is resolved.
  */
 type CurrentVariantSelection = {
     override: string | null | undefined;
-    inherited: string | undefined;
+    inherited: string | null | undefined;
 };
 
-const resolveVariantFromSelection = (selection: CurrentVariantSelection): string | undefined => (
-    selection.override === null ? undefined : selection.override ?? selection.inherited
-);
+const resolveVariantFromSelection = (selection: CurrentVariantSelection): string | undefined => {
+    if (selection.override === null) return undefined;
+    const variant = selection.override ?? selection.inherited;
+    return variant ?? undefined;
+};
 
 const hasCompatibleCachedVariants = (providers: ProviderWithModelList[] | undefined): boolean => (
     Array.isArray(providers) && providers.every((provider) => (
@@ -1270,8 +1387,8 @@ const hasCompatibleCachedVariants = (providers: ProviderWithModelList[] | undefi
  * `currentVariantSelection` but wrote the resolved default to `currentVariant`
  * showed one effort in the picker and sent another.
  */
-const variantAfterResolve = (selection: CurrentVariantSelection | undefined, resolved: string | undefined): string | undefined => (
-    selection?.override === undefined ? resolved : resolveVariantFromSelection(selection)
+const variantAfterResolve = (selection: CurrentVariantSelection | undefined, resolved: string | null | undefined): string | undefined => (
+    selection?.override === undefined ? resolved ?? undefined : resolveVariantFromSelection(selection)
 );
 
 /**
@@ -1348,6 +1465,21 @@ const isUnchangedSelection = (
     return SELECTION_FIELDS.every((field) => !(field in next) || (next[field] === state[field] && next[field] === snapshot[field]));
 };
 
+/**
+ * An effort is chosen for one model, so a change of model drops it, an
+ * explicit "Default" included. The composer then resolves the new model's own
+ * effort: the one this session saved for it, else its configured default.
+ */
+const variantResetForModelChange = (
+    state: Pick<ConfigStore, "currentProviderId" | "currentModelId">,
+    providerId: string,
+    modelId: string,
+): Partial<Pick<DirectoryScopedConfig, "currentVariant" | "currentVariantSelection">> => (
+    state.currentProviderId === providerId && state.currentModelId === modelId
+        ? {}
+        : { currentVariant: undefined, currentVariantSelection: { override: undefined, inherited: undefined } }
+);
+
 const createEmptyDirectoryScopedConfig = (
     providers: ProviderWithModelList[] = [],
     agents: Agent[] = [],
@@ -1388,7 +1520,7 @@ const resolveSelectionWithManualGuard = ({
     resolvedAgentName: string | undefined;
     resolvedProviderId: string | undefined;
     resolvedModelId: string | undefined;
-    resolvedVariant: string | undefined;
+    resolvedVariant: string | null | undefined;
 }) => {
     const manualAgentName = currentAgentName;
     const manualModelValid = !!currentProviderId
@@ -1435,6 +1567,12 @@ interface ConfigStore {
     lastInitFailure: InitFailure | null;
     /** Projects whose OpenCode config OpenCode refused to load, keyed by config-directory key. Runtime-only. */
     projectConfigErrors: Record<string, ProjectConfigError>;
+    /**
+     * Per config-directory key: providers whose every model generates images.
+     * Kept apart from `providers`, which feeds the chat pickers; only Settings →
+     * Providers lists them. Runtime-only.
+     */
+    imageOnlyProviders: Record<string, ProviderWithModelList[]>;
     isInitialized: boolean;
     modelsMetadata: Map<string, ModelMetadata>;
     // OpenChamber settings-based defaults (take precedence over agent preferences)
@@ -1473,14 +1611,21 @@ interface ConfigStore {
     openaiCompatibleUrl: string;
     openaiCompatibleVoice: string;
     openaiCompatibleTtsModel: string;
+    /** Optional resource path for the OpenAI-compatible speech endpoint. */
+    openaiCompatibleTtsEndpointPath: string;
     // STT (dictation) settings
     dictationEnabled: boolean;
+    dictationAutoSend: boolean;
     sttProvider: 'local' | 'openai-compatible';
     sttServerUrl: string;
     sttModel: string;
+    /** Optional resource path for the OpenAI-compatible transcription endpoint. */
+    sttEndpointPath: string;
     sttLocalModel: string;
     sttLanguage: string;
+    sttCorrectTranscript: boolean;
     showMessageTTSButtons: boolean;
+    autoReadAloudEnabled: boolean;
     ttsInputMode: 'sanitized' | 'raw' | 'summarized';
     ttsChunkedMode: boolean;
     // Summarization settings
@@ -1507,13 +1652,18 @@ interface ConfigStore {
     setOpenaiCompatibleUrl: (url: string) => void;
     setOpenaiCompatibleVoice: (voice: string) => void;
     setOpenaiCompatibleTtsModel: (model: string) => void;
+    setOpenaiCompatibleTtsEndpointPath: (path: string) => void;
     setDictationEnabled: (enabled: boolean) => void;
+    setDictationAutoSend: (enabled: boolean) => void;
     setSttProvider: (provider: 'local' | 'openai-compatible') => void;
     setSttServerUrl: (url: string) => void;
     setSttModel: (model: string) => void;
+    setSttEndpointPath: (path: string) => void;
     setSttLocalModel: (model: string) => void;
     setSttLanguage: (lang: string) => void;
+    setSttCorrectTranscript: (enabled: boolean) => void;
     setShowMessageTTSButtons: (show: boolean) => void;
+    setAutoReadAloudEnabled: (enabled: boolean) => void;
     setTtsInputMode: (mode: 'sanitized' | 'raw' | 'summarized') => void;
     setTtsChunkedMode: (enabled: boolean) => void;
     setSummarizeMessageTTS: (enabled: boolean) => void;
@@ -1533,9 +1683,11 @@ interface ConfigStore {
     setProvider: (providerId: string) => void;
     setModel: (modelId: string) => void;
     setCurrentVariant: (variant: string | undefined) => void;
-    setCurrentVariantOverride: (override: string | null | undefined, inherited: string | undefined) => void;
+    setCurrentVariantOverride: (override: string | null | undefined, inherited: string | null | undefined) => void;
     cycleCurrentVariant: () => string | undefined;
     getCurrentModelVariants: () => string[];
+    /** The effort the project of `directory` (the active one when omitted) or Settings configures for this model; `undefined` for any model that is not a configured default. */
+    getDefaultVariantForModel: (providerId: string, modelId: string, directory?: string | null) => string | undefined;
     /**
      * `keepModel` switches the agent alone. It is for following a switch the
      * session already made: OpenCode keeps a session on its own model when the
@@ -1544,6 +1696,13 @@ interface ConfigStore {
      */
     setAgent: (agentName: string | undefined, options?: { keepModel?: boolean }) => void;
     applyDefaultModelAgentSelection: (options?: { projectDefaultAgent?: string; projectDefaultModel?: string; projectDefaultVariant?: string }) => void;
+    /**
+     * What a new session in `directory` starts on, from that directory's own
+     * catalogs and defaults. The composer's pick and the active directory play
+     * no part, and nothing in the store's selection changes. `null` when no
+     * model resolves or the runtime changed meanwhile.
+     */
+    resolveDirectoryDefaultSelection: (directory: string) => Promise<DirectoryDefaultSelection | null>;
     /** Replaces an `openchamber/auto` selection this server cannot honour with the default model. */
     dropStaleAutoSelection: () => void;
     applyOpenCodeConfigDefaults: (directory?: string | null, source?: string, config?: Config) => void;
@@ -1623,6 +1782,18 @@ export const selectProvidersForDirectory = (
 const EMPTY_PROVIDERS: ProviderWithModelList[] = [];
 const EMPTY_AGENTS: Agent[] = [];
 
+/**
+ * Providers of one project that offer only image models. Settings → Providers
+ * lists them next to `selectProvidersForDirectory`; no chat picker reads them.
+ */
+export const selectImageOnlyProvidersForDirectory = (
+    state: Pick<ConfigStore, "imageOnlyProviders" | "activeDirectoryKey">,
+    directory?: string | null,
+): ProviderWithModelList[] => {
+    const directoryKey = directory == null ? state.activeDirectoryKey : toConfigDirectoryKey(directory);
+    return state.imageOnlyProviders[directoryKey] ?? EMPTY_PROVIDERS;
+};
+
 export const selectConfigAgentsForDirectory = (
     state: Pick<ConfigStore, 'agents' | 'directoryScoped' | 'activeDirectoryKey'>,
     directory?: string | null,
@@ -1634,9 +1805,9 @@ export const selectConfigAgentsForDirectory = (
 
 /**
  * A model as any loaded catalog lists it: the active directory's first, then
- * the snapshots of the others. For display only. A directory OpenCode is still
- * starting answers with a partial catalog for a second or two, and the
- * composer keeps the name it already knows meanwhile instead of a raw id.
+ * the snapshots of the others. For display only. While a directory's catalog
+ * has not loaded yet, the composer keeps the name it already knows instead of
+ * a raw id.
  * Selection, variants and validation stay on the active catalog.
  */
 export const selectKnownCatalogModel = (
@@ -1733,6 +1904,7 @@ export const useConfigStore = create<ConfigStore>()(
                 lastDisconnectReason: null,
                 lastInitFailure: null,
                 projectConfigErrors: {},
+                imageOnlyProviders: {},
                 isInitialized: false,
                 modelsMetadata: new Map<string, ModelMetadata>(),
                 settingsDefaultModel: undefined,
@@ -1860,6 +2032,7 @@ export const useConfigStore = create<ConfigStore>()(
                     }
                     return 'kokoro';
                 })(),
+                openaiCompatibleTtsEndpointPath: getSafeStorage().getItem('openaiCompatibleTtsEndpointPath') ?? '',
                 // Voice input (dictation) master toggle - default enabled
                 dictationEnabled: (() => {
                     if (typeof window !== 'undefined') {
@@ -1868,6 +2041,7 @@ export const useConfigStore = create<ConfigStore>()(
                     }
                     return true;
                 })(),
+                dictationAutoSend: getSafeStorage().getItem('dictationAutoSend') === 'true',
                 // STT provider: 'local' (server-side sherpa-onnx) or 'openai-compatible'
                 sttProvider: (() => {
                     if (typeof window !== 'undefined') {
@@ -1893,12 +2067,15 @@ export const useConfigStore = create<ConfigStore>()(
                     }
                     return 'deepdml/faster-whisper-large-v3-turbo-ct2';
                 })(),
+                sttEndpointPath: getSafeStorage().getItem('sttEndpointPath') ?? '',
                 sttLocalModel: (() => {
                     if (typeof window !== 'undefined') {
                         const saved = localStorage.getItem('sttLocalModel');
                         if (saved) return saved;
                     }
-                    return 'parakeet-tdt-0.6b-v2-int8';
+                    // Not picked yet: the server chooses the model, see the
+                    // dictation service's resolveLocalModelId.
+                    return '';
                 })(),
                 sttLanguage: (() => {
                     if (typeof window !== 'undefined') {
@@ -1907,6 +2084,8 @@ export const useConfigStore = create<ConfigStore>()(
                     }
                     return '';
                 })(),
+                // Fix misheard words with the Small Model after dictation - off by default
+                sttCorrectTranscript: globalThis.localStorage?.getItem('sttCorrectTranscript') === 'true',
                 // Show TTS buttons on messages - disabled by default until user enables it
                 showMessageTTSButtons: (() => {
                     if (typeof window !== 'undefined') {
@@ -1914,6 +2093,11 @@ export const useConfigStore = create<ConfigStore>()(
                         if (saved === 'true') return true;
                     }
                     return false;
+                })(),
+                // Read the final reply automatically when a turn ends - disabled by default
+                autoReadAloudEnabled: (() => {
+                    const saved = globalThis.window?.localStorage?.getItem('autoReadAloudEnabled');
+                    return saved === 'true';
                 })(),
                 ttsInputMode: (() => {
                     if (typeof window !== 'undefined') {
@@ -2000,7 +2184,9 @@ export const useConfigStore = create<ConfigStore>()(
                             currentVariant: carriedOverride ?? undefined,
                             currentVariantSelection: {
                                 override: carriedOverride,
-                                inherited: snapshot?.currentVariantSelection?.inherited ?? snapshot?.currentVariant,
+                                inherited: snapshot?.currentVariantSelection?.inherited !== undefined
+                                    ? snapshot.currentVariantSelection.inherited
+                                    : snapshot?.currentVariant,
                             },
                         };
                         const carried = manualModel ?? carriedVariant;
@@ -2134,6 +2320,14 @@ export const useConfigStore = create<ConfigStore>()(
                             nextState.directoryScoped = nextDirectoryScoped;
                         }
 
+                        if (targetDirectoryKey === null) {
+                            if (Object.keys(state.imageOnlyProviders).length > 0) nextState.imageOnlyProviders = {};
+                        } else if (state.imageOnlyProviders[targetDirectoryKey]) {
+                            const { [targetDirectoryKey]: _cleared, ...imageOnlyProviders } = state.imageOnlyProviders;
+                            void _cleared;
+                            nextState.imageOnlyProviders = imageOnlyProviders;
+                        }
+
                         if (targetDirectoryKey === null || targetDirectoryKey === state.activeDirectoryKey) {
                             nextState.providersLoaded = false;
                             if (state.providers.length > 0) {
@@ -2210,12 +2404,16 @@ export const useConfigStore = create<ConfigStore>()(
                                 ? { [apiResult.default.providerID]: apiResult.default.id }
                                 : {};
 
+                            // The catalog carries chat and image models. Only chat models
+                            // (an unset type is chat) reach `providers` and the pickers.
                             const modelsByProvider = new Map<string, ProviderModel[]>();
+                            const imageModelsByProvider = new Map<string, ProviderModel[]>();
                             for (const model of catalogModels) {
                                 if (!model.enabled) continue;
-                                const bucket = modelsByProvider.get(model.providerID);
+                                const byProvider = model.type === "image" ? imageModelsByProvider : modelsByProvider;
+                                const bucket = byProvider.get(model.providerID);
                                 if (bucket) bucket.push(model);
-                                else modelsByProvider.set(model.providerID, [model]);
+                                else byProvider.set(model.providerID, [model]);
                             }
                             // A provider the user switched off, or one with no usable
                             // model, is not offerable — v2 replaced the `connected` list
@@ -2226,18 +2424,24 @@ export const useConfigStore = create<ConfigStore>()(
                                     ...provider,
                                     models: modelsByProvider.get(provider.id) ?? [],
                                 }));
+                            // A provider with image models only is still configured and
+                            // manageable, so Settings lists it; chat never offers it.
+                            const imageOnlyProviders: ProviderWithModelList[] = providers
+                                .filter((provider) => provider.activation !== "disabled"
+                                    && !modelsByProvider.has(provider.id)
+                                    && imageModelsByProvider.has(provider.id))
+                                .map((provider) => ({
+                                    ...provider,
+                                    models: imageModelsByProvider.get(provider.id) ?? [],
+                                }));
 
                             if (!isConfigRuntimeContextCurrent(runtimeContext)) return;
-                            if (holdFirstLoadAgainstCache(_providersShownFromCache, inFlightKey, countCatalogModels(processedProviders))) {
-                                // The cached catalog stays on screen; this answer is likely a
-                                // location still starting. The re-read is applied as it is.
-                                markStartupTrace('loadProviders:heldAgainstCache', { directoryKey, source, providers: processedProviders.length });
-                                setTimeout(() => {
-                                    if (!isConfigRuntimeContextCurrent(runtimeContext)) return;
-                                    void get().loadProviders({ directory: fromDirectoryKey(directoryKey), source: CATALOG_CACHE_RECHECK_SOURCE, fresh: true });
-                                }, CATALOG_CACHE_RECHECK_MS);
-                                return;
-                            }
+                            set((state) => {
+                                const previous = state.imageOnlyProviders[directoryKey] ?? EMPTY_PROVIDERS;
+                                return isSameProviderCatalog(previous, imageOnlyProviders)
+                                    ? state
+                                    : { imageOnlyProviders: { ...state.imageOnlyProviders, [directoryKey]: imageOnlyProviders } };
+                            });
                             // A re-read that returns the same catalog keeps the arrays the
                             // store already holds, so nothing subscribed to them re-renders.
                             const nextProviders = isSameProviderCatalog(previousProviders, processedProviders)
@@ -2364,8 +2568,8 @@ export const useConfigStore = create<ConfigStore>()(
                                 models: processedProviders.reduce((count, provider) => count + provider.models.length, 0),
                             });
                             markCatalogLoaded(_providersLoadedAt, _providersStaleAt, directoryKey, loadRevision);
-                            if (nextProviders !== previousProviders || nextDefaults !== previousDefaults || source === CATALOG_CACHE_RECHECK_SOURCE) {
-                                persistLoadedCatalog(runtimeContext, directoryKey, source, { providers: nextProviders, defaultProviders: nextDefaults }, nextProviders.length === 0, _providersStaleAt, loadRevision);
+                            if (nextProviders !== previousProviders || nextDefaults !== previousDefaults) {
+                                persistLoadedCatalog(runtimeContext, directoryKey, { providers: nextProviders, defaultProviders: nextDefaults }, _providersStaleAt, loadRevision);
                             }
                             return;
                         } catch (error) {
@@ -2507,14 +2711,17 @@ export const useConfigStore = create<ConfigStore>()(
                             defaultProviders: state.defaultProviders,
                         };
 
+                        const variantReset = variantResetForModelChange(state, providerId, newModelId);
                         const nextSnapshot: DirectoryScopedConfig = {
                             ...baseSnapshot,
+                            ...variantReset,
                             currentProviderId: providerId,
                             currentModelId: newModelId,
                             selectionSource: "manual",
                         };
 
                         return {
+                            ...variantReset,
                             currentProviderId: providerId,
                             currentModelId: newModelId,
                             selectionSource: "manual",
@@ -2545,13 +2752,16 @@ export const useConfigStore = create<ConfigStore>()(
                             defaultProviders: state.defaultProviders,
                         };
  
+                        const variantReset = variantResetForModelChange(state, state.currentProviderId, modelId);
                         const nextSnapshot: DirectoryScopedConfig = {
                             ...baseSnapshot,
+                            ...variantReset,
                             currentModelId: modelId,
                             selectionSource: "manual",
                         };
  
                         return {
+                            ...variantReset,
                             currentModelId: modelId,
                             selectionSource: "manual",
                             directoryScoped: {
@@ -2609,6 +2819,18 @@ export const useConfigStore = create<ConfigStore>()(
                     return modelVariantNames(get().getCurrentModel());
                 },
 
+                getDefaultVariantForModel: (providerId: string, modelId: string, directory?: string | null) => {
+                    const state = get();
+                    const configDirectory = directory ? normalizeConfigPath(directory) : null;
+                    return resolveConfiguredDefaultVariant({
+                        ...(configDirectory
+                            ? readProjectDefaults(configDirectory)
+                            : getProjectDefaultsForConfigDirectory(fromDirectoryKey(state.activeDirectoryKey))),
+                        settingsDefaultModel: state.settingsDefaultModel,
+                        settingsDefaultVariant: state.settingsDefaultVariant,
+                    }, providerId, modelId);
+                },
+
                 cycleCurrentVariant: () => {
                     const variantKeys = get().getCurrentModelVariants();
                     if (variantKeys.length === 0) {
@@ -2617,7 +2839,9 @@ export const useConfigStore = create<ConfigStore>()(
 
                     const state = get();
                     const currentOverride = state.currentVariantSelection.override;
-                    const inheritedVariant = state.currentVariantSelection.inherited ?? state.currentVariant;
+                    const inheritedVariant = state.currentVariantSelection.inherited !== undefined
+                        ? state.currentVariantSelection.inherited
+                        : state.currentVariant;
                     const currentVariant = currentOverride === undefined
                         ? state.currentVariant
                         : currentOverride;
@@ -2631,6 +2855,9 @@ export const useConfigStore = create<ConfigStore>()(
                     }
 
                     get().setCurrentVariantOverride(nextOverride, inheritedVariant);
+                    // Cycling is a picker choice too: it becomes the model's
+                    // remembered level without waiting for a send.
+                    rememberEffort(state.currentProviderId, state.currentModelId, nextOverride ?? null);
                     return nextOverride ?? undefined;
                 },
  
@@ -2726,11 +2953,14 @@ export const useConfigStore = create<ConfigStore>()(
                             settingsZenModel: defaults.zenModel,
                             settingsMessageStreamTransport: defaults.messageStreamTransport ?? state.settingsMessageStreamTransport,
                             dictationEnabled: typeof defaults.dictationEnabled === 'boolean' ? defaults.dictationEnabled : state.dictationEnabled,
+                            dictationAutoSend: defaults.dictationAutoSend ?? state.dictationAutoSend,
                             sttProvider: defaults.sttProvider ?? state.sttProvider,
                             sttServerUrl: defaults.sttServerUrl ?? state.sttServerUrl,
                             sttModel: defaults.sttModel ?? state.sttModel,
+                            sttEndpointPath: defaults.sttEndpointPath ?? state.sttEndpointPath,
                             sttLocalModel: defaults.sttLocalModel ?? state.sttLocalModel,
                             sttLanguage: defaults.sttLanguage ?? state.sttLanguage,
+                            sttCorrectTranscript: defaults.sttCorrectTranscript ?? state.sttCorrectTranscript,
                         };
                         if (!useSessionUIStore.getState().currentSessionId && state.selectionSource === 'auto' && state.agentSelectionSource === 'auto' && next.settingsDefaultAgent) {
                             next.currentAgentName = next.settingsDefaultAgent;
@@ -2824,16 +3054,6 @@ export const useConfigStore = create<ConfigStore>()(
                                 throw new Error('Session defaults are not available yet');
                             }
                             const safeAgents = Array.isArray(agents) ? agents : [];
-                            if (holdFirstLoadAgainstCache(_agentsShownFromCache, inFlightKey, safeAgents.length)) {
-                                // Same as providers: the cached agents stay until the re-read.
-                                markStartupTrace('loadAgents:heldAgainstCache', { directoryKey, source, agents: safeAgents.length });
-                                setTimeout(() => {
-                                    if (!isConfigRuntimeContextCurrent(runtimeContext)) return;
-                                    void get().loadAgents({ directory: configDirectoryPath, source: CATALOG_CACHE_RECHECK_SOURCE, fresh: true });
-                                }, CATALOG_CACHE_RECHECK_MS);
-                                return true;
-                            }
-
                             const latestSyncedOpencodeConfig = getSyncConfig(requestedDirectory ?? undefined)
                                 ?? getSyncConfig(configDirectoryPath ?? undefined);
                             const hasLatestSyncedOpencodeConfig = latestSyncedOpencodeConfig !== undefined;
@@ -2977,7 +3197,7 @@ export const useConfigStore = create<ConfigStore>()(
                                     agents: safeAgents.length,
                                 });
                                 markCatalogLoaded(_agentsLoadedAt, _agentsStaleAt, directoryKey, loadRevision);
-                                persistLoadedCatalog(runtimeContext, directoryKey, source, { agents: safeAgents }, safeAgents.length === 0, _agentsStaleAt, loadRevision);
+                                persistLoadedCatalog(runtimeContext, directoryKey, { agents: safeAgents }, _agentsStaleAt, loadRevision);
                                 clearProjectConfigError(directoryKey);
                                 return true;
                             }
@@ -3089,7 +3309,7 @@ export const useConfigStore = create<ConfigStore>()(
                                 agents: safeAgents.length,
                             });
                             markCatalogLoaded(_agentsLoadedAt, _agentsStaleAt, directoryKey, loadRevision);
-                            persistLoadedCatalog(runtimeContext, directoryKey, source, { agents: safeAgents }, safeAgents.length === 0, _agentsStaleAt, loadRevision);
+                            persistLoadedCatalog(runtimeContext, directoryKey, { agents: safeAgents }, _agentsStaleAt, loadRevision);
                             _agentsLoadErrors.delete(directoryKey);
                             clearProjectConfigError(directoryKey);
                             return true;
@@ -3105,7 +3325,7 @@ export const useConfigStore = create<ConfigStore>()(
                             });
                             // A rejected project config fails the same way until the
                             // user edits the file; retrying only delays the message.
-                            if (readProjectConfigError(error)) break;
+                            if (readProjectConfigError(error) || (error instanceof Error && isLocationNotFound(error))) break;
                             const waitMs = 200 * (attempt + 1);
                             await new Promise((resolve) => setTimeout(resolve, waitMs));
                             if (!isCurrentAgentLoad()) return false;
@@ -3114,7 +3334,7 @@ export const useConfigStore = create<ConfigStore>()(
 
                     if (!isCurrentAgentLoad()) return false;
                     console.error("Failed to load agents:", lastError);
-                    _agentsLoadErrors.set(directoryKey, lastError instanceof Error ? lastError.message : String(lastError ?? ''));
+                    _agentsLoadErrors.set(directoryKey, lastError instanceof Error ? lastError : new Error(String(lastError ?? '')));
                     const configError = readProjectConfigError(lastError);
                     if (configError && !isSameProjectConfigError(get().projectConfigErrors[directoryKey], configError)) {
                         set((state) => ({ projectConfigErrors: { ...state.projectConfigErrors, [directoryKey]: configError } }));
@@ -3194,7 +3414,6 @@ export const useConfigStore = create<ConfigStore>()(
                         agents,
                         providers,
                         settingsDefaultModel,
-                        settingsDefaultVariant,
                         currentProviderId,
                         currentModelId,
                         currentAgentName,
@@ -3318,13 +3537,15 @@ export const useConfigStore = create<ConfigStore>()(
                             });
                         };
 
+                        const agent = agents.find((candidate) => candidate.name === agentName);
+
                         const resolveVariantSelectionForModel = (
                             providerId: string,
                             modelId: string,
-                            agentVariant?: string,
                         ): CurrentVariantSelection => {
                             const model = findProviderModel(providers, providerId, modelId);
-                            if (model && modelVariantNames(model).length === 0) return { override: undefined, inherited: undefined };
+                            const variantOptions = model ? modelVariantNames(model) : undefined;
+                            if (variantOptions && variantOptions.length === 0) return { override: undefined, inherited: undefined };
 
                             // A model the catalog does not list (Auto, or a stale
                             // selection) cannot rule a variant out, so inherited
@@ -3335,7 +3556,19 @@ export const useConfigStore = create<ConfigStore>()(
                                 && (!model || modelHasVariant(model, candidate))
                             );
 
-                            const inherited = [agentVariant, settingsDefaultVariant].find(isAvailable);
+                            // Like a configured default, the agent's effort belongs to
+                            // the model it is configured with. A level this model was
+                            // last sent with fills in when neither names one.
+                            const agentVariant = agent?.model?.providerID === providerId && agent.model.id === modelId
+                                ? agent.model.variant
+                                : undefined;
+                            const configuredVariant = get().getDefaultVariantForModel(providerId, modelId);
+                            const inherited = variantOptions
+                                ? resolveEffortChoice(
+                                    [agentVariant, configuredVariant, readRememberedEffort(providerId, modelId)],
+                                    variantOptions,
+                                )
+                                : [agentVariant, configuredVariant].find(isAvailable);
 
                             const savedVariant = currentSessionId
                                 ? useSelectionStore.getState().getAgentModelVariantForSession(
@@ -3364,8 +3597,6 @@ export const useConfigStore = create<ConfigStore>()(
                             return { override: undefined, inherited };
                         };
 
-                        const agent = agents.find((candidate) => candidate.name === agentName);
-
                         // Prefer a session-level manual override for this agent over the
                         // agent's configured default. Re-applying setAgent after subtask
                         // completion / rematerialization must not clobber the override
@@ -3376,7 +3607,7 @@ export const useConfigStore = create<ConfigStore>()(
                                 applyResolvedModelSelection(
                                     existingAgentModel.providerId,
                                     existingAgentModel.modelId,
-                                    resolveVariantSelectionForModel(existingAgentModel.providerId, existingAgentModel.modelId, agent?.model?.variant),
+                                    resolveVariantSelectionForModel(existingAgentModel.providerId, existingAgentModel.modelId),
                                     "manual",
                                 );
                                 return;
@@ -3394,7 +3625,7 @@ export const useConfigStore = create<ConfigStore>()(
                                 applyResolvedModelSelection(
                                     providerID,
                                     modelID,
-                                    resolveVariantSelectionForModel(providerID, modelID, agent?.model?.variant),
+                                    resolveVariantSelectionForModel(providerID, modelID),
                                     "auto",
                                 );
                                 return;
@@ -3441,7 +3672,7 @@ export const useConfigStore = create<ConfigStore>()(
                                     applyResolvedModelSelection(
                                         parsed.providerId,
                                         parsed.modelId,
-                                        resolveVariantSelectionForModel(parsed.providerId, parsed.modelId, agent?.model?.variant),
+                                        resolveVariantSelectionForModel(parsed.providerId, parsed.modelId),
                                         "auto",
                                     );
                                     return;
@@ -3487,14 +3718,14 @@ export const useConfigStore = create<ConfigStore>()(
                             ...baseSnapshot,
                             currentProviderId: resolved.providerId,
                             currentModelId: resolved.modelId,
-                            currentVariant: resolved.variant,
+                            currentVariant: resolved.variant ?? undefined,
                             currentVariantSelection: { override: undefined, inherited: resolved.variant },
                             selectionSource: "auto",
                         };
                         return {
                             currentProviderId: resolved.providerId,
                             currentModelId: resolved.modelId,
-                            currentVariant: resolved.variant,
+                            currentVariant: resolved.variant ?? undefined,
                             currentVariantSelection: { override: undefined, inherited: resolved.variant },
                             selectionSource: "auto",
                             directoryScoped: { ...state.directoryScoped, [directoryKey]: nextSnapshot },
@@ -3559,7 +3790,7 @@ export const useConfigStore = create<ConfigStore>()(
                             currentAgentName: resolvedAgentName,
                             currentProviderId: resolvedProviderId ?? '',
                             currentModelId: resolvedModelId ?? '',
-                            currentVariant: resolvedVariant,
+                            currentVariant: resolvedVariant ?? undefined,
                             currentVariantSelection: { override: undefined, inherited: resolvedVariant },
                             selectionSource: "auto",
                             agentSelectionSource: "auto",
@@ -3569,7 +3800,7 @@ export const useConfigStore = create<ConfigStore>()(
                             currentAgentName: resolvedAgentName,
                             currentProviderId: nextSnapshot.currentProviderId,
                             currentModelId: nextSnapshot.currentModelId,
-                            currentVariant: resolvedVariant,
+                            currentVariant: resolvedVariant ?? undefined,
                             currentVariantSelection: { override: undefined, inherited: resolvedVariant },
                             selectionSource: "auto",
                             agentSelectionSource: "auto",
@@ -3581,6 +3812,44 @@ export const useConfigStore = create<ConfigStore>()(
 
                         return nextState;
                     });
+                },
+
+                resolveDirectoryDefaultSelection: async (directory) => {
+                    const runtimeContext = captureConfigRuntimeContext();
+                    const configDirectory = resolveConfigDirectory(directory);
+                    if (!configDirectory) return null;
+                    const directoryKey = toDirectoryKey(configDirectory);
+                    const source = 'resolveDirectoryDefaultSelection';
+                    const [, , config] = await Promise.all([
+                        get().loadProviders({ directory: configDirectory, source }).catch(() => undefined),
+                        get().loadAgents({ directory: configDirectory, source }).catch(() => false),
+                        // A directory nothing has synced yet, such as a new worktree, has no config event to read.
+                        getSyncConfig(configDirectory) ?? opencodeClient.getConfig(configDirectory).catch(() => undefined),
+                    ]);
+                    if (!isConfigRuntimeContextCurrent(runtimeContext)) return null;
+
+                    const state = get();
+                    const snapshot = state.directoryScoped[directoryKey];
+                    const isActive = state.activeDirectoryKey === directoryKey;
+                    const resolved = resolveDefaultAgentModelSelection({
+                        agents: isActive ? state.agents : (snapshot?.agents ?? []),
+                        providers: isActive ? state.providers : (snapshot?.providers ?? []),
+                        ...readProjectDefaults(configDirectory),
+                        settingsDefaultAgent: state.settingsDefaultAgent,
+                        settingsDefaultModel: state.settingsDefaultModel,
+                        settingsDefaultVariant: state.settingsDefaultVariant,
+                        opencodeDefaultAgent: config ? normalizeOptionalString(config.default_agent) : snapshot?.opencodeDefaultAgent,
+                        opencodeDefaultModel: config ? configModelIdentifier(config.model) : snapshot?.opencodeDefaultModel,
+                        allowFallback: state.settingsDefaultsLoaded,
+                        fallbackPrefs: readFallbackModelPrefs(),
+                    });
+                    if (!resolved.providerId || !resolved.modelId) return null;
+                    return {
+                        agentName: resolved.agentName,
+                        providerId: resolved.providerId,
+                        modelId: resolved.modelId,
+                        variant: resolved.variant,
+                    };
                 },
 
                 applyOpenCodeConfigDefaults: (directory, source = "syncConfig", config) => {
@@ -3914,12 +4183,29 @@ export const useConfigStore = create<ConfigStore>()(
                     }
                 },
 
+                setOpenaiCompatibleTtsEndpointPath: (path: string) => {
+                    set({ openaiCompatibleTtsEndpointPath: path });
+                    getSafeStorage().setItem('openaiCompatibleTtsEndpointPath', path);
+                },
+
                 setDictationEnabled: (enabled: boolean) => {
                     set({ dictationEnabled: enabled });
                     if (typeof window !== 'undefined') {
                         localStorage.setItem('dictationEnabled', String(enabled));
                     }
                     updateDesktopSettings({ dictationEnabled: enabled }).catch(() => {});
+                },
+
+                setSttCorrectTranscript: (enabled: boolean) => {
+                    set({ sttCorrectTranscript: enabled });
+                    globalThis.localStorage?.setItem('sttCorrectTranscript', String(enabled));
+                    updateDesktopSettings({ sttCorrectTranscript: enabled }).catch(() => {});
+                },
+
+                setDictationAutoSend: (enabled: boolean) => {
+                    set({ dictationAutoSend: enabled });
+                    getSafeStorage().setItem('dictationAutoSend', String(enabled));
+                    updateDesktopSettings({ dictationAutoSend: enabled }).catch(() => {});
                 },
 
                 setSttProvider: (provider: 'local' | 'openai-compatible') => {
@@ -3947,6 +4233,12 @@ export const useConfigStore = create<ConfigStore>()(
                     updateDesktopSettings({ sttModel: model }).catch(() => {});
                 },
 
+                setSttEndpointPath: (path: string) => {
+                    set({ sttEndpointPath: path });
+                    getSafeStorage().setItem('sttEndpointPath', path);
+                    updateDesktopSettings({ sttEndpointPath: path }).catch(() => {});
+                },
+
                 setSttLocalModel: (model: string) => {
                     set({ sttLocalModel: model });
                     if (typeof window !== 'undefined') {
@@ -3968,6 +4260,11 @@ export const useConfigStore = create<ConfigStore>()(
                     if (typeof window !== 'undefined') {
                         localStorage.setItem('showMessageTTSButtons', String(show));
                     }
+                },
+
+                setAutoReadAloudEnabled: (enabled: boolean) => {
+                    set({ autoReadAloudEnabled: enabled });
+                    globalThis.window?.localStorage?.setItem('autoReadAloudEnabled', String(enabled));
                 },
 
                 setTtsInputMode: (mode: 'sanitized' | 'raw' | 'summarized') => {
@@ -4107,6 +4404,7 @@ export const useConfigStore = create<ConfigStore>()(
                     }
 
                     const runtimeContext = captureConfigRuntimeContext();
+                    const instanceGeneration = configInstanceGeneration;
                     const run = (async () => {
                         const initStarted = typeof performance !== 'undefined' ? performance.now() : Date.now();
                         markStartupTrace('initializeApp:start');
@@ -4151,7 +4449,8 @@ export const useConfigStore = create<ConfigStore>()(
                             const initialDirectory = opencodeClient.getDirectory()
                                 ?? useDirectoryStore.getState().currentDirectory
                                 ?? fromDirectoryKey(get().activeDirectoryKey);
-                            const resolvedProject = resolveProjectForSessionDirectory(
+                            // A space's directory loads no project config of the host (see resolveProjectDirectory).
+                            const resolvedProject = isSpaceDirectory(initialDirectory) ? null : resolveProjectForSessionDirectory(
                                 useProjectsStore.getState().projects,
                                 useSessionUIStore.getState().availableWorktreesByProject,
                                 initialDirectory ?? null,
@@ -4159,13 +4458,21 @@ export const useConfigStore = create<ConfigStore>()(
                             const resolvedInitialDirectory = (resolvedProject || resolveProjectDirectory(initialDirectory))
                                 ? resolveConfigDirectory(initialDirectory)
                                 : null;
-                            const configDirectory = resolvedInitialDirectory ?? getFallbackProjectDirectory();
+                            // An open session offers its own folder's agents and models,
+                            // the catalog activateDirectory loads when it is opened. A
+                            // folder outside every project (a chat) must not borrow the
+                            // active project's, whose agents the session cannot run.
+                            const sessionState = useSessionUIStore.getState();
+                            const openSessionDirectory = sessionState.currentSessionId
+                                ? resolveConfigDirectory(sessionState.currentSessionDirectory)
+                                : null;
+                            const configDirectory = openSessionDirectory ?? resolvedInitialDirectory ?? getFallbackProjectDirectory();
                             if (!configDirectory) {
                                 markStartupTrace('initializeApp:noProjectConfigDirectory');
                                 set({ isInitialized: true, isConnected: true, hasEverConnected: true, connectionPhase: "connected", lastInitFailure: null });
                                 return;
                             }
-                            if (!resolvedInitialDirectory && initialDirectory !== configDirectory) {
+                            if (!openSessionDirectory && !resolvedInitialDirectory && initialDirectory !== configDirectory) {
                                 markStartupTrace('initializeApp:normalizedUnknownDirectoryToProject', {
                                     initialDirectory,
                                     configDirectory,
@@ -4195,18 +4502,22 @@ export const useConfigStore = create<ConfigStore>()(
                                 const configError = get().projectConfigErrors[configDirectoryKey];
                                 if (configError) {
                                     markStartupTrace('initializeApp:projectConfigInvalid', { configDirectoryKey, name: configError.name });
-                                } else if (await opencodeClient.getDirectoryAvailability(configDirectory) === 'missing') {
+                                } else if (isLocationNotFound(_agentsLoadErrors.get(configDirectoryKey))
+                                    || await opencodeClient.getDirectoryAvailability(configDirectory) === 'missing') {
                                     if (!isConfigRuntimeContextCurrent(runtimeContext)) return;
                                     markStartupTrace('initializeApp:projectDirectoryMissing', { configDirectoryKey });
                                 } else {
-                                    set({ lastInitFailure: { step: 'loadAgents', message: _agentsLoadErrors.get(configDirectoryKey) || null } });
+                                    set({ lastInitFailure: { step: 'loadAgents', message: _agentsLoadErrors.get(configDirectoryKey)?.message || null } });
                                     return;
                                 }
                             }
                             set({ isInitialized: true, isConnected: true, hasEverConnected: true, connectionPhase: "connected", lastInitFailure: null });
                             // A plugin registers its agents while the server is already serving, so
                             // the load above can race it. Re-check once, after startup has settled.
-                            setTimeout(() => void get().loadAgents({ directory: configDirectory, source: 'startupAgentRecheck' }), 8_000);
+                            setTimeout(() => {
+                                if (instanceGeneration !== configInstanceGeneration) return;
+                                void get().loadAgents({ directory: configDirectory, source: 'startupAgentRecheck' });
+                            }, 8_000);
                             const initEnded = typeof performance !== 'undefined' ? performance.now() : Date.now();
                             markStartupTrace('initializeApp:end', {
                                 durationMs: Math.round(initEnded - initStarted),
@@ -4260,18 +4571,44 @@ export const useConfigStore = create<ConfigStore>()(
                     }
                     const { modelsMetadata, providers } = get();
                     const cached = modelsMetadata.get(key);
-                    const model = findCatalogModel(providers.find((p) => p.id === providerId)?.models, modelId);
+                    const provider = providers.find((p) => p.id === providerId);
+                    const model = findCatalogModel(provider?.models, modelId);
 
                     // The running OpenCode's limits win over the models.dev
                     // catalog: providers adjust them per auth (ChatGPT sign-in
                     // serves GPT models with a 400K window, the catalog says 1M+).
                     if (cached) {
-                        if (!model || model.limit.context <= 0) return cached;
-                        return { ...cached, limit: { ...cached.limit, context: model.limit.context, output: model.limit.output } };
+                        if (!model) return cached;
+                        const releaseDate = runtimeModelReleaseDate(model.time?.released);
+                        const hasLiveLimits = model.limit.context > 0;
+                        if (!hasLiveLimits && !releaseDate) return cached;
+                        const metadata: ModelMetadata = { ...cached };
+                        if (hasLiveLimits) {
+                            metadata.limit = {
+                                ...cached.limit,
+                                context: model.limit.context,
+                                output: model.limit.output,
+                            };
+                        }
+                        if (releaseDate) metadata.release_date = releaseDate;
+                        return metadata;
                     }
 
                     // Fallback: derive metadata from provider model data (covers custom providers not in models.dev)
-                    return model ? deriveModelMetadata(providerId, model) : undefined;
+                    if (!model) return undefined;
+                    const derived = deriveModelMetadata(providerId, model);
+                    const descriptive = findDescriptiveMetadata(modelsMetadata, model, provider?.canonical);
+                    if (!descriptive) return derived;
+                    const supplemented: ModelMetadata = { ...derived };
+                    const knowledge = normalizeOptionalString(descriptive.knowledge);
+                    if (knowledge) supplemented.knowledge = knowledge;
+                    if (!supplemented.release_date) {
+                        const releaseDate = normalizeOptionalString(descriptive.release_date);
+                        if (releaseDate) supplemented.release_date = releaseDate;
+                    }
+                    const lastUpdated = normalizeOptionalString(descriptive.last_updated);
+                    if (lastUpdated) supplemented.last_updated = lastUpdated;
+                    return supplemented;
                 },
                 getVisibleAgents: () => {
                     const { agents } = get();
@@ -4355,6 +4692,7 @@ export const useConfigStore = create<ConfigStore>()(
                     settingsZenModel: state.settingsZenModel,
                     settingsMessageStreamTransport: state.settingsMessageStreamTransport,
                     dictationEnabled: state.dictationEnabled,
+                    dictationAutoSend: state.dictationAutoSend,
                     speechRate: state.speechRate,
                     speechPitch: state.speechPitch,
                     speechVolume: state.speechVolume,

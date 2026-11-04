@@ -82,7 +82,11 @@ export const UsageSidebar: React.FC<UsageSidebarProps> = ({ onItemSelect }) => {
           <span className="typography-micro text-muted-foreground">{t('settings.usage.sidebar.field.display')}</span>
           <Select value={usageDisplayMode} onValueChange={handleUsageDisplayModeChange}>
             <SelectTrigger className="w-fit">
-              <SelectValue placeholder={t('settings.usage.sidebar.field.displayModePlaceholder')} />
+              <SelectValue>
+                {usageDisplayMode === 'remaining'
+                  ? t('settings.usage.sidebar.field.displayModeRemaining')
+                  : t('settings.usage.sidebar.field.displayModeUsage')}
+              </SelectValue>
             </SelectTrigger>
             <SelectContent>
               <SelectItem value="usage">{t('settings.usage.sidebar.field.displayModeUsage')}</SelectItem>
@@ -130,7 +134,7 @@ export const UsageSidebar: React.FC<UsageSidebarProps> = ({ onItemSelect }) => {
                   {provider.name}
                 </span>
               {configured === false && (
-                <span className="typography-micro text-muted-foreground/60 flex-shrink-0">{t('settings.usage.sidebar.status.notSet')}</span>
+                <span className="typography-micro text-muted-foreground flex-shrink-0">{t('settings.usage.sidebar.status.notSet')}</span>
               )}
             </button>
           </div>

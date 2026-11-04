@@ -1,6 +1,6 @@
 {
   "name": "@openchamber/electron",
-  "version": "2.4.0",
+  "version": "2.6.0",
   "private": true,
   "description": "Electron desktop runtime for OpenChamber",
   "author": "OpenChamber",
@@ -8,7 +8,7 @@
   "type": "module",
   "main": "./dist-bundle/entry.mjs",
   "opencodeCli": {
-    "version": "2.0.32"
+    "version": "2.2.5"
   },
   "dependencies": {
     "@openchamber/web": "workspace:*",
@@ -19,7 +19,7 @@
   },
   "devDependencies": {
     "@electron/rebuild": "^4.2.0",
-    "electron": "^44.9.0",
+    "electron": "^44.10.0",
     "electron-builder": "^26.0.0",
     "node-abi": "^4.33.0"
   },
@@ -54,13 +54,14 @@
     "verify:update-manifest": "node ./scripts/verify-update-manifest.mjs",
     "package": "bun run build:web-assets && bun run prepare:opencode-cli && bun run prepare:ripgrep && bun run bundle:main && bun run rebuild:native && node ./scripts/package.mjs",
     "finalize:latest-yml": "node ./scripts/finalize-latest-yml.mjs",
-    "type-check": "node --check ./entry.mjs && node --check ./early-startup.mjs && node --check ./main.mjs && node --check ./preload.mjs",
+    "type-check": "node --check ./entry.mjs && node --check ./early-startup.mjs && node --check ./main.mjs && node --check ./preload.mjs && node --check ./browser-panel-preload.cjs",
     "lint": "node -e \"process.exit(0)\""
   },
   "build": {
     "appId": "dev.openchamber.desktop",
     "productName": "OpenChamber",
     "asarUnpack": [
+      "node_modules/7zip-bin/win/**/*",
       "node_modules/@openchamber/web/server/built-in-extensions/**/*",
       "node_modules/@openchamber/web/server/lib/git/credential-helper.js",
       "node_modules/@openchamber/web/server/lib/git/ssh-wrapper.js",
@@ -71,6 +72,7 @@
       "dist-bundle/main.mjs",
       "dist-bundle/early-startup.mjs",
       "preload.mjs",
+      "browser-panel-preload.cjs",
       "!**/node_modules/**/*.{ts,mts,cts,tsx,map}",
       "!**/node_modules/**/!(LICENSE*|LICENCE*|license*|licence*|License*).md",
       "!**/node_modules/bun-pty{,/**}",
@@ -79,6 +81,9 @@
       "!node_modules/@openchamber/web/*.{html,tgz}",
       "!node_modules/@openchamber/web/{tsconfig.json,tsconfig.tsbuildinfo}",
       "!node_modules/@openchamber/web/server/**/*.test.js",
+      "!**/node_modules/7zip-bin/{linux,mac}{,/**}",
+      "!**/node_modules/7zip-bin/!(${os})/**/*",
+      "!**/node_modules/7zip-bin/win/!(${arch}){,/**}",
       "!node_modules/node-pty/prebuilds/!(${platform}-${arch}){,/**}",
       "!**/node_modules/@vscode/ripgrep-*{,/**}"
     ],
@@ -174,6 +179,7 @@
     "nsis": {
       "oneClick": true,
       "perMachine": false,
+      "include": "resources/installer.nsh",
       "installerIcon": "resources/icons/icon.ico",
       "uninstallerIcon": "resources/icons/icon.ico",
       "installerHeaderIcon": "resources/icons/icon.ico"

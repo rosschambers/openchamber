@@ -3,16 +3,20 @@ import type { Session } from '@/lib/opencode/model';
 
 import { useGlobalSessionsStore, resolveGlobalSessionDirectory } from '@/stores/useGlobalSessionsStore';
 import { isBtwSession } from '@/lib/sessionBtwMetadata';
+import { isWorkflowAgentSession } from '@/lib/sessionWorkflowMetadata';
 import { useProjectsStore } from '@/stores/useProjectsStore';
 import { useSessionPinnedStore } from '@/stores/useSessionPinnedStore';
 import { useGitAllBranches } from '@/stores/useGitStore';
 import type { SessionNode } from '../types';
 import { isPathWithinProject, normalizePath } from '../utils';
-import { buildWorktreeByPathIndex } from '../worktreeIndex';
+import { buildWorktreeByPathIndex, findPrefixWorktreeEntry } from '../worktreeIndex';
 import { compareSessionsByLifecycleOrder, useSessionOrderingStore } from '@/sync/session-ordering';
 import { useSessionUIStore } from '@/sync/session-ui-store';
 import { isVSCodeRuntime } from '@/lib/desktop';
+import { isVSCodeWithoutWorkspace } from '@/lib/vscodeBootstrap';
 import { isChatDirectoryPath } from '@/lib/chatDirectories';
+import { spaceProjectDirectoryIn, useSpacesStore } from '@/lib/spaces/spaces-store';
+import { isSessionDirectoryAdmitted } from '@/sync/session-admission-rule';
 
 export type SwitcherItem = {
   node: SessionNode;
@@ -129,18 +133,22 @@ export const useSwitcherItems = (enabled: boolean, options: SwitcherItemsOptions
     [availableWorktreesByProject, normalizedProjects],
   );
 
+  const spaceMarks = useSpacesStore((state) => state.spaces);
+  const spacesJourney = useSpacesStore((state) => state.journey);
   const findProjectForDirectory = React.useCallback(
-    (directory: string | null) => {
+    (sessionDirectory: string | null) => {
+      // A space's session belongs to the project the space was made from.
+      const directory = spaceProjectDirectoryIn({ spaces: spaceMarks, journey: spacesJourney }, sessionDirectory) ?? sessionDirectory;
       if (!directory) return null;
       // Known worktree → its project, regardless of where the worktree lives.
-      const worktreeHit = worktreeByPath.get(normalizePath(directory) ?? directory);
+      const worktreeHit = findPrefixWorktreeEntry(normalizePath(directory) ?? directory, worktreeByPath);
       if (worktreeHit) return worktreeHit.project;
       const matches = normalizedProjects
         .filter((project) => isPathWithinProject(directory, project.normalizedPath))
         .sort((a, b) => (b.normalizedPath?.length ?? 0) - (a.normalizedPath?.length ?? 0));
       return matches[0] ?? null;
     },
-    [normalizedProjects, worktreeByPath],
+    [normalizedProjects, spaceMarks, spacesJourney, worktreeByPath],
   );
 
   const items = React.useMemo<SwitcherItem[]>(() => {
@@ -148,9 +156,12 @@ export const useSwitcherItems = (enabled: boolean, options: SwitcherItemsOptions
 
     const childrenByParent = new Map<string, Session[]>();
     for (const session of activeSessions) {
+      if (!isSessionDirectoryAdmitted(resolveGlobalSessionDirectory(session), projects, availableWorktreesByProject)) continue;
       const parentId = (session as Session & { parentID?: string | null }).parentID;
       if (!parentId) continue;
       if (session.time?.archived) continue;
+      // A workflow run can start a hundred agents; its card lists them.
+      if (isWorkflowAgentSession(session)) continue;
       const bucket = childrenByParent.get(parentId);
       if (bucket) {
         bucket.push(session);
@@ -171,7 +182,8 @@ export const useSwitcherItems = (enabled: boolean, options: SwitcherItemsOptions
       (session) => findProjectForDirectory(resolveGlobalSessionDirectory(session))?.id ?? null,
       maxParents,
       // btw forks stay hidden until promoted to a full session
-      (session) => isBtwSession(session) || (isVSCode && isChatDirectoryPath(resolveGlobalSessionDirectory(session))),
+      (session) => isBtwSession(session) || (isVSCode && !isVSCodeWithoutWorkspace() && isChatDirectoryPath(resolveGlobalSessionDirectory(session)))
+        || !isSessionDirectoryAdmitted(resolveGlobalSessionDirectory(session), projects, availableWorktreesByProject),
     );
 
     const buildNode = (session: Session): SessionNode => {
@@ -189,7 +201,7 @@ export const useSwitcherItems = (enabled: boolean, options: SwitcherItemsOptions
       const projectLabel = formatProjectLabel(matchedProject);
       // Live git branch when available; the discovered worktree branch fills
       // in for directories whose git status hasn't been fetched yet.
-      const worktreeHit = directory ? worktreeByPath.get(normalizePath(directory) ?? directory) : null;
+      const worktreeHit = directory ? findPrefixWorktreeEntry(normalizePath(directory) ?? directory, worktreeByPath) : null;
       const liveBranch = directory ? branchesByDirectory.get(directory) : undefined;
       const branchLabel = liveBranch ?? worktreeHit?.meta.branch?.trim() ?? null;
       return {
@@ -202,7 +214,7 @@ export const useSwitcherItems = (enabled: boolean, options: SwitcherItemsOptions
         },
       };
     });
-  }, [activeSessions, branchesByDirectory, currentSessionId, enabled, findProjectForDirectory, isVSCode, maxParents, pinnedSessionIds, scopeProjectId, sessionOrderRanks, worktreeByPath]);
+  }, [activeSessions, availableWorktreesByProject, branchesByDirectory, currentSessionId, enabled, findProjectForDirectory, isVSCode, maxParents, pinnedSessionIds, projects, scopeProjectId, sessionOrderRanks, worktreeByPath]);
 
   return items;
 };

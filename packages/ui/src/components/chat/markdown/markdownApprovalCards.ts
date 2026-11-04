@@ -32,9 +32,10 @@ const cardSource = (link: HTMLAnchorElement, trustedOrigins: readonly string[]):
   return `${url.origin}${url.pathname}?view=card`;
 };
 
-// What decorate.ts adds beside an external link: the favicon (kept out of
-// message image exports) and the loopback preview button.
-const LINK_DECORATION_SELECTOR = `[${MESSAGE_IMAGE_EXPORT_EXCLUDE_ATTRIBUTE}], [data-md-action="preview-loopback"]`;
+// What MarkdownLink.tsx renders beside an external link: the favicon (kept
+// out of message image exports) before it, and the loopback preview button
+// (marked data-export-ignore) after it.
+const LINK_DECORATION_SELECTOR = `[${MESSAGE_IMAGE_EXPORT_EXCLUDE_ATTRIBUTE}], [data-export-ignore]`;
 
 const isBlankOrDecoration = (node: ChildNode): boolean => {
   if (node.nodeType === node.TEXT_NODE) return !node.textContent?.trim();
@@ -64,7 +65,7 @@ const createCardFrame = (document: Document, source: string): HTMLIFrameElement 
 };
 
 const replaceApprovalLinks = (container: HTMLElement, trustedOrigins: readonly string[]): void => {
-  for (const link of Array.from(container.querySelectorAll<HTMLAnchorElement>('a.external-link'))) {
+  for (const link of Array.from(container.querySelectorAll<HTMLAnchorElement>('a'))) {
     const source = cardSource(link, trustedOrigins);
     const paragraph = source ? ownParagraph(link) : null;
     if (!source || !paragraph) continue;

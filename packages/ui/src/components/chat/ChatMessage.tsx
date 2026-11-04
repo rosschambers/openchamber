@@ -1,6 +1,8 @@
 import React from 'react';
+import { MessageSliceContext } from './message/messageSliceContext';
 import { modelVariantNames } from '@/lib/modelVariants';
 import { findCatalogModel, type Message, type Part } from '@/lib/opencode/model';
+import { readPromptOrigin } from '@/lib/opencode/prompt-origin';
 import { useShallow } from 'zustand/react/shallow';
 
 import { MessageFreshnessDetector } from '@/lib/messageFreshness';
@@ -24,9 +26,10 @@ import type { StreamPhase, ToolPopupContent } from './message/types';
 import { deriveMessageRole } from './message/messageRole';
 import { filterVisibleParts, normalizeParts } from './message/partUtils';
 import { normalizeUserDisplayParts } from './message/normalizeUserDisplayParts';
+import { useSourceControlDescriptorOf } from '@/lib/source-control/providers/registry';
 import { isHiddenUserMessage } from './message/hiddenUserMessage';
 import { flattenAssistantTextParts, flattenUserTextParts } from '@/lib/messages/messageText';
-import { isLikelyProviderAuthFailure, PROVIDER_AUTH_FAILURE_MESSAGE } from '@/lib/messages/providerAuthError';
+import { assistantErrorNotice } from '@/lib/messages/assistantError';
 import { getProviderModelDisplayName } from '@/lib/modelDisplay';
 import { lazyWithChunkRecovery } from '@/lib/chunkLoadRecovery';
 import type { TurnGroupingContext } from './lib/turns/types';
@@ -38,6 +41,7 @@ import type { ReviewTransferDirection } from '@/lib/reviewFlow';
 import { toast } from 'sonner';
 import { useCopyMessageLink } from './message/useCopyMessageLink';
 import { useI18n } from '@/lib/i18n';
+import { useSnippetsStore } from '@/stores/useSnippetsStore';
 import { useGlobalSessionsStore } from '@/stores/useGlobalSessionsStore';
 import { getContextObligatoryMessages } from '@/lib/contextObligatoryMessages';
 import { setContextObligatoryMessage } from '@/sync/session-actions';
@@ -79,12 +83,12 @@ function useStickyDisplayValue<T>(value: T | null | undefined): T | null | undef
 // Assistant text goes to the clipboard as Markdown with its rendered HTML,
 // or as the plain text the reader sees when the user asked for that.
 const copyAssistantText = async (text: string) => {
-    const { renderMarkdownSync } = await import('./markdown/markdownCore');
-    const html = renderMarkdownSync(text);
+    const { renderMarkdownForExport } = await import('./markdown/renderMarkdownForExport');
+    const root = await renderMarkdownForExport(text, { purpose: 'copy' });
     const plainText = useUIStore.getState().copyMessagesAsPlainText
-        ? (await import('./markdown/selectionMarkdown')).renderedMarkdownHtmlToPlainText(html, document)
+        ? (await import('./markdown/selectionMarkdown')).serializeRenderedMarkdown(root, 'plain')
         : undefined;
-    return copyMarkdownToClipboard(text, html, { plainText });
+    return copyMarkdownToClipboard(text, root.innerHTML, { plainText });
 };
 
 const getMessageInfoProp = (info: unknown, key: string): unknown => {
@@ -130,6 +134,11 @@ const ChatMessage: React.FC<ChatMessageProps> = ({
     const canPinIntoContext = !isVSCodeRuntime();
     const { currentTheme } = useThemeSystem();
     const messageContainerRef = React.useRef<HTMLDivElement | null>(null);
+    // A long answer's later rows draw the rest of this message; they carry its
+    // id for search and quotes, and name their slice so navigation and the
+    // message's anchor id stay on its first row.
+    const slice = React.useContext(MessageSliceContext);
+    const sliceName = slice?.from ? `${slice.from.partId}:${slice.from.offset}` : undefined;
 
     const getAgentModelForSession = useSelectionStore((s) => s.getAgentModelForSession);
     const getSessionModelSelection = useSelectionStore((s) => s.getSessionModelSelection);
@@ -172,14 +181,16 @@ const ChatMessage: React.FC<ChatMessageProps> = ({
         }))
     );
 
+    // Change-request chips are labelled by their provider; the lookup changes when the list lands.
+    const descriptorOf = useSourceControlDescriptorOf();
     const normalizedParts = React.useMemo(() => {
         const safeParts = normalizeParts(message.parts);
         if (!isUser) {
             return safeParts;
         }
 
-        return normalizeUserDisplayParts(safeParts);
-    }, [isUser, message.parts]);
+        return normalizeUserDisplayParts(safeParts, descriptorOf);
+    }, [descriptorOf, isUser, message.parts]);
 
     const agentName = React.useMemo(() => {
         if (isUser) return undefined;
@@ -313,6 +324,8 @@ const ChatMessage: React.FC<ChatMessageProps> = ({
             }),
         [normalizedParts, showReasoningTraces]
     );
+
+    const promptOrigin = React.useMemo(() => readPromptOrigin(message.info), [message.info]);
 
     const agentMention = React.useMemo(() => {
         if (!isUser) {
@@ -468,37 +481,7 @@ const ChatMessage: React.FC<ChatMessageProps> = ({
         if (isFollowedByAssistant) {
             return undefined;
         }
-        const errorInfo = (message.info as { error?: unknown } | undefined)?.error as
-            | { data?: { message?: unknown }; message?: unknown; name?: unknown }
-            | undefined;
-        if (!errorInfo) {
-            return undefined;
-        }
-        const dataMessage = typeof errorInfo.data?.message === 'string' ? errorInfo.data.message : undefined;
-        const errorMessage = typeof errorInfo.message === 'string' ? errorInfo.message : undefined;
-        const errorName = typeof errorInfo.name === 'string' ? errorInfo.name : undefined;
-        const detail = dataMessage || errorMessage || errorName;
-        if (!detail) {
-            return undefined;
-        }
-        if (errorName === 'SessionRetry') {
-            return {
-                text: `Opencode failed to send a message. Retry attempt info: ${detail}`,
-            };
-        }
-        if (isLikelyProviderAuthFailure(detail)) {
-            return {
-                text: PROVIDER_AUTH_FAILURE_MESSAGE,
-            };
-        }
-        if (detail.trim().toLowerCase() === 'aborted') {
-            return {
-                text: 'The running turn was stopped before OpenCode could send the next message.',
-            };
-        }
-        return {
-            text: `Opencode failed to send message with error: ${detail}`,
-        };
+        return assistantErrorNotice(message.info);
     }, [isFollowedByAssistant, isUser, message.info]);
 
     const assistantErrorText = assistantError?.text;
@@ -541,6 +524,10 @@ const ChatMessage: React.FC<ChatMessageProps> = ({
         }
         return true;
     }, [isUser, messageTextContent]);
+
+    const handleSaveAsSnippet = React.useCallback(() => {
+        useSnippetsStore.getState().openQuickCreate({ content: messageTextContent });
+    }, [messageTextContent]);
 
     const handleCopyTurn = React.useCallback(async () => {
         const turnText = [...(earlierAssistantText ?? []), messageTextContent].filter((text) => text.length > 0).join('\n\n');
@@ -602,12 +589,11 @@ const ChatMessage: React.FC<ChatMessageProps> = ({
 
     const setImagePreviewOpen = useUIStore((state) => state.setImagePreviewOpen);
 
+    // Images and diagrams open the overlay; a text payload (a pasted text
+    // attachment) opens the content dialog.
     const handleShowPopup = React.useCallback((content: ToolPopupContent) => {
-
-        if (content.image || content.mermaid) {
-            setPopupContent(content);
-            setImagePreviewOpen(true);
-        }
+        setPopupContent(content);
+        setImagePreviewOpen(true);
     }, [setImagePreviewOpen]);
 
     const handlePopupChange = React.useCallback((open: boolean) => {
@@ -636,10 +622,15 @@ const ChatMessage: React.FC<ChatMessageProps> = ({
                 className={cn(
                     'group w-full',
                     isUser ? (isMobile ? 'pt-2' : 'pt-4') : 'pt-0',
-                    isUser ? 'pb-0' : (isFollowedByAssistant || nextIsHiddenUserMessage) ? 'pb-0' : 'pb-2'
+                    // In the transcript the gap under an answer is the
+                    // turn's (TurnItem gapBelow); only ungrouped lists (BTW) keep it here.
+                    isUser || hasTurnGrouping || isFollowedByAssistant || nextIsHiddenUserMessage ? 'pb-0' : 'pb-2'
                 )}
-                id={`message-${message.info.id}`}
+                id={sliceName ? undefined : `message-${message.info.id}`}
                 data-message-id={message.info.id}
+                data-message-slice={sliceName}
+                data-message-continues={slice?.to ? '' : undefined}
+                data-message-row={slice ? `${slice.index}/${slice.count}` : undefined}
                 ref={messageContainerRef}
             >
                 <div className="chat-message-column relative">
@@ -651,7 +642,9 @@ const ChatMessage: React.FC<ChatMessageProps> = ({
                                 ignoreContextDisabled
                                 respectReducedMotion
                             >
-                                <div className={cn('relative flex flex-col items-end', !isMobile ? 'group/user-shell' : undefined)}>
+                                {/* In a sticky turn header (TurnItem) the desktop row keeps
+                                    the whole 44px gap to the reply, under the header's fade. */}
+                                <div className={cn('relative flex flex-col items-end', !isMobile ? 'group/user-shell in-data-[turn-sticky-header]:pb-3' : undefined)}>
                                     {/* peek: the action row is suppressed, so reserve only its
                                         gap to the next message, OUTSIDE the bubble background. */}
                                     <div className={cn('max-w-[85%]', chatSurfaceMode === 'peek' ? 'pb-3' : undefined)}>
@@ -686,6 +679,7 @@ const ChatMessage: React.FC<ChatMessageProps> = ({
                                                 onCopyMessage={handleCopyMessage}
                                                 onCopyLink={handleCopyLink}
                                                 copiedMessage={copiedMessage}
+                                                onSaveAsSnippet={handleSaveAsSnippet}
                                                 showReasoningTraces={showReasoningTraces}
                                                 agentMention={agentMention}
                                                 onRevert={handleRevert}
@@ -696,6 +690,7 @@ const ChatMessage: React.FC<ChatMessageProps> = ({
                                                 errorMessage={assistantErrorText}
                                                 errorResponseBody={assistantErrorResponseBody}
                                                 extraActions={guestMessageActions}
+                                                promptOrigin={promptOrigin}
                                             />
                                         </div>
                                     </div>
@@ -721,6 +716,7 @@ const ChatMessage: React.FC<ChatMessageProps> = ({
                                         onCopyMessage={handleCopyMessage}
                                         onCopyLink={handleCopyLink}
                                         copiedMessage={copiedMessage}
+                                        onSaveAsSnippet={handleSaveAsSnippet}
                                         showReasoningTraces={showReasoningTraces}
                                         agentMention={agentMention}
                                         onRevert={handleRevert}

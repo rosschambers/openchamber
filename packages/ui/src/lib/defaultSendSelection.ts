@@ -1,4 +1,5 @@
 import { parseModelIdentifier } from '@/lib/modelIdentifier';
+import { resolveEffortChoice, resolveEffortForModelSelection } from '@/lib/modelEfforts';
 import { modelVariantNames } from '@/lib/modelVariants';
 import { useConfigStore } from '@/stores/useConfigStore';
 import { useSelectionStore } from '@/sync/selection-store';
@@ -33,9 +34,14 @@ const resolveDefaultModelSelection = (): { providerID: string; modelID: string }
   return { providerID: parsed.providerId, modelID: parsed.modelId };
 };
 
-const resolveDefaultVariant = (providerID: string, modelID: string): string | undefined => {
+const resolveDefaultVariant = (
+  providerID: string,
+  modelID: string,
+  agentName: string | undefined,
+): string | null | undefined => {
   const configState = useConfigStore.getState();
-  const settingsDefaultVariant = configState.settingsDefaultVariant;
+  // The configured effort belongs to its default model; on the fallback model it does not apply.
+  const configuredVariant = configState.getDefaultVariantForModel(providerID, modelID);
   const currentVariant = configState.currentProviderId === providerID && configState.currentModelId === modelID
     ? configState.currentVariant
     : undefined;
@@ -43,15 +49,18 @@ const resolveDefaultVariant = (providerID: string, modelID: string): string | un
   const model = provider?.models.find((entry) => entry.id === modelID);
   const variantNames = modelVariantNames(model);
   if (variantNames.length === 0) {
-    return settingsDefaultVariant || currentVariant || undefined;
+    return configuredVariant || currentVariant || undefined;
   }
-  if (settingsDefaultVariant && variantNames.includes(settingsDefaultVariant)) {
-    return settingsDefaultVariant;
-  }
-  if (currentVariant && variantNames.includes(currentVariant)) {
-    return currentVariant;
-  }
-  return undefined;
+  // The agent's pin for this model is configuration too; after it the level
+  // this model was last sent with, then whatever the composer currently shows.
+  // `null` is an explicit Default and is kept as the answer.
+  return resolveEffortChoice(
+    [resolveEffortForModelSelection({
+      providerID, modelID, variants: variantNames,
+      agents: configState.agents, agentName, configuredVariant,
+    }), currentVariant],
+    variantNames,
+  );
 };
 
 export const captureDefaultSendSelection = () => {
@@ -64,5 +73,5 @@ export const captureDefaultSendSelection = () => {
   if (!providerID || !modelID) {
     return null;
   }
-  return { providerID, modelID, agentName, variant: resolveDefaultVariant(providerID, modelID) };
+  return { providerID, modelID, agentName, variant: resolveDefaultVariant(providerID, modelID, agentName) };
 };

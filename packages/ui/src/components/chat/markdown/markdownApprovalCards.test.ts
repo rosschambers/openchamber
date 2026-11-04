@@ -28,7 +28,7 @@ Object.assign(globalThis, {
 });
 
 const TRUSTED = 'https://approvals.example';
-const link = (href: string, text = href): string => `<a href="${href}" class="external-link" target="_blank" rel="noopener noreferrer">${text}</a>`;
+const link = (href: string, text = href): string => `<a href="${href}" target="_blank" rel="noopener noreferrer">${text}</a>`;
 
 const detachers: (() => void)[] = [];
 
@@ -70,9 +70,9 @@ describe('approval cards', () => {
   });
 
   test('the link decorations (favicon, loopback preview button) do not count as other content', () => {
-    // The shape decorate.ts leaves around an external link, as seen in a live message.
+    // The shape MarkdownLink.tsx renders around an external link, as seen in a live message.
     const favicon = '<span data-message-image-export-exclude="true" class="me-1 inline-flex"><img src="https://icons.example/approvals.ico" alt=""></span>';
-    const preview = '<button type="button" data-md-action="preview-loopback" data-md-url="http://127.0.0.1:8080/a/LOCAL1"></button>';
+    const preview = '<button type="button" data-export-ignore data-md-url="http://127.0.0.1:8080/a/LOCAL1"></button>';
     const container = mount(
       `<p>${favicon}${link(`${TRUSTED}/a/ABC123`)}</p><p>${favicon}${link('http://127.0.0.1:8080/a/LOCAL1')}${preview}</p>`,
       [TRUSTED, 'http://127.0.0.1:8080'],

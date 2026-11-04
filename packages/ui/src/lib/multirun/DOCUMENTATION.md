@@ -35,7 +35,10 @@ The run's model and agent are set on the session at creation (`selection`),
 because v2 pins a session to a model instead of taking one per prompt.
 
 A failed binding attempts to delete only that newly created session. Worktrees
-are retained because setup may already have written files. Successful siblings
+are retained because setup may already have written files. A lane, added lane
+or code fusion whose new worktree never populated has nothing in it; that
+worktree and its branch are removed (`resolveCreatedWorktreeStartDirectory`)
+and the lane counts as failed. Successful siblings
 remain usable and creation reports the failed count. Runtime changes stop later
 requests, registration and dispatch.
 
@@ -84,6 +87,14 @@ the kept one:
 4. removes its worktree and local branch, unless another active chat still
    lives there.
 
+A member of a project opened on a folder of its repository runs in that folder
+of its worktree (`<worktree>/ai`). `memberLocation.locateRunMember` finds the
+checkout that holds the member's directory and never answers a checkout that
+holds a registered project: git lists the primary checkout `repo` among the
+worktrees of the project `repo/ai`, and removing it would remove the project.
+OpenCode lists sessions by exact directory, so step 4 asks both the worktree
+root and the member's folder for other active chats.
+
 A failed step stops cleanup for that member only and leaves its worktree in
 place; the result reports it. The project root is never removed. Snapshot refs
 stay until someone deletes them; cleaning them up is not implemented.
@@ -109,9 +120,25 @@ and no answer at all is `NoFusionOutputsError`.
 Fusion results keep the group identity with role `fusion`, so they join the run
 as its first card. `autoFusion.ts` starts the configured fusion exactly once, on
 the page that launched the run (`RUN_LAUNCHER_ID`), when every lane was seen
-running on this page and has since left the live busy set with an outcome.
+running on this page and has since left the live busy set with an outcome,
+with no running subagent below it. The descendant check uses the same merged
+session map as run membership, so it covers nested children across directories.
+An idle lane with a running descendant must record a newer `time.idle` before
+it can finish, so a gap between the child settling and the parent resuming
+cannot start fusion with the earlier outcome. The completion timestamp also
+covers a parent resumption that starts and finishes within one UI update.
+The status reducer's synchronous transition subscription records a lane's wait
+before the next event in a batch can settle its child. A busy transition clears
+that wait for the resumed parent, even if its next completion shares the batch.
 Persisted history never counts as finished; another client, or the launcher
 after a reload, fuses from the overview instead.
+
+### Why automatic fusion waits for descendants
+
+A parent can report idle with an outcome while a background subagent still
+runs, then resume to incorporate its result. Checking the parent's status
+alone would send its preliminary answer to fusion. The shared live subagent
+check keeps automatic fusion pending through that pause.
 
 ## Overview
 

@@ -6,16 +6,30 @@
 import type { FilePart, FormRequest, JsonValue, Message, Metadata, ModelSelection, Part, PermissionRequest, Session, SyntheticMessage, TextPart, UserMessage } from "@/lib/opencode/model"
 import { compact, partIds } from "@/lib/opencode/model"
 import { readSubagentRun } from "@/lib/opencode/subagent-run"
-import { readDispatchedSessionResult } from "@/lib/opencode/dispatched-session"
+import { isAutoModel } from "@/lib/routing/autoModel"
 import { Binary } from "./binary"
+import { dropSessionCaches } from "./session-cache"
+import { forkAtTranscriptCut, isTurnBoundary, transcriptCutAfterMessage, transcriptCutForMessage } from "./transcript-cut"
 import { useSessionUIStore } from "./session-ui-store"
+import { useSelectionStore } from "./selection-store"
+import {
+  noteLocalFormCancelled,
+  noteLocalFormReplied,
+  submitRecoveredAnswer,
+  type RecoveredQuestion,
+} from "./recoverable-questions"
+import { resolveSendSelection } from "./session-selection"
 import { useInputStore } from "./input-store"
 import type { ChildStoreManager } from "./child-store"
 import { computeSubtreeIds } from "./scoped-blocking-requests"
+import { withUserWorkTitle } from "@/lib/sessionWorkTitle"
 import { opencodeClient, type SyntheticContextInput } from "@/lib/opencode/client"
+import { findMessagePageItem } from "@/lib/opencode/messagePaging"
 import { toJsonRecord } from "@/lib/opencode/json"
 import { ascendingId } from "@/lib/opencode/ids"
 import { mergeSessionDirectoryMetadata, resolveGlobalSessionDirectory, useGlobalSessionsStore } from "@/stores/useGlobalSessionsStore"
+import { readGlobalSessionLineage } from "@/stores/sessionLineage"
+import { isRestorableOnItsOwn } from "./session-restore-rule"
 import { useConfigStore } from "@/stores/useConfigStore"
 import { waitForOpenCodeStartup } from "./opencode-startup-gate"
 import { registerSessionDirectory } from "./sync-refs"
@@ -35,28 +49,32 @@ import {
 } from "@/lib/sessionReviewMetadata"
 import { withContextObligatoryMessage, type ContextObligatoryMessage } from "@/lib/contextObligatoryMessages"
 import { getBtwOriginalSessionID, getBtwSessionID, isBtwSession, withoutBtwSessionLink } from "@/lib/sessionBtwMetadata"
-import { withLinkedIssue, type LinkedIssue } from "@/lib/linkedIssues"
+import { type LinkedIssue } from "@/lib/linkedIssues"
 import { withSessionWorkState, type SessionWork } from "@/lib/sessionWorkMetadata"
 import { withSessionPinned } from "@/lib/sessionPins"
 import { getImperativeSessionMessageLoader } from "./session-message-loader"
 import { cleanupPersistedSessionState } from "./session-deletion-cleanup"
-import { requestSessionArchiveBatch, requestSessionMetadataUpdate, requestSessionUnarchiveBatch, type SessionArchiveStamp } from "./session-archive-batch"
+import { requestSessionArchiveBatch, requestSessionLinksUpdate, requestSessionMetadataUpdate, requestSessionUnarchiveBatch, type SessionArchiveStamp } from "./session-archive-batch"
 import { registerBulkArchiveEchoes, releaseBulkArchiveEchoes } from "./bulk-archive-echo"
-import { getRuntimeKey } from "@/lib/runtime-switch"
+import { markSessionUnreadSeen } from "./session-unread"
+import { captureRuntimeInstance, getRuntimeKey } from "@/lib/runtime-switch"
 import { isRelayModeActive } from "@/lib/relay/runtime-tunnel"
 import { getErrorStatus, isAmbiguousSendFailure } from "./send-failure-classification"
+import { isFormRequestNotFoundError } from "./form-request-error"
 import { getStaleRunningToolMessageID } from "./materialization"
 import { promoteRestoredSessionOrdering } from "./session-ordering"
 import { normalizePath } from "@/lib/pathNormalization"
 import { mergeMessages } from "./optimistic"
+import { trackPromptInFlight } from "./prompts-in-flight"
 import { messagesBefore, messagesFrom } from "./message-ordering"
 import { deleteChatDirectory } from "@/lib/chatDirectories"
-import { createChatDraftIdentity } from "@/lib/chatDraftPersistence"
+import { createChatDraftIdentity, type ChatDraftIdentity } from "@/lib/chatDraftPersistence"
 import { cancelSessionTitleGeneration } from "./session-title-generation"
 import { recordSessionActionFailure } from "./session-action-failures"
 import { applyForkInheritance } from "@/lib/sessionForkInheritance"
 import { getSessionGoal } from "@/lib/sessionGoalMetadata"
 import { fetchGoalObjectiveContent, writeGoalObjectiveFile } from "@/lib/goalObjectiveFiles"
+import { isVSCodeRuntime } from "@/lib/desktop"
 
 const MESSAGE_REFETCH_LIMIT = 100
 const SEND_CONFIRMATION_REFETCH_LIMIT = 30
@@ -346,14 +364,65 @@ export async function moveSessionToDirectory(
  * The global list already took the directory from the same event.
  */
 export function adoptSessionMove(sessionId: string, sourceDirectory: string, destinationDirectory: string): void {
+  // A session created under a path the server then canonicalized has its
+  // record in the destination already and only its first message at the source.
   const session = _childStores?.getChild(sourceDirectory)?.getState().session.find((candidate) => candidate.id === sessionId)
+    ?? _childStores?.getChild(destinationDirectory)?.getState().session.find((candidate) => candidate.id === sessionId)
   if (!session) return
   relocateSession(session, sourceDirectory, destinationDirectory)
+}
+
+function withNewRequests<T extends { id: string }>(current: T[], incoming: T[] | undefined) {
+  const added = incoming?.filter((request) => !current.some((existing) => existing.id === request.id)) ?? []
+  return added.length > 0 ? [...current, ...added] : current
+}
+
+/**
+ * A session's transcript, status and pending requests are read from the store
+ * of the directory it lives in. A store it passed through earlier can still
+ * hold a copy, and events without a location would be routed to it: the copy
+ * goes, and a pending permission or form in it joins the owner's. The session
+ * lists stay: a parent repository lists its worktrees' sessions.
+ */
+function dropSessionLiveStateOutside(sessionId: string, ownerDirectory: string): void {
+  const stores = _childStores
+  const owner = stores?.getChild(ownerDirectory)
+  if (!stores || !owner) return
+  let permissions = owner.getState().permission[sessionId] ?? []
+  let forms = owner.getState().form[sessionId] ?? []
+  for (const store of stores.children.values()) {
+    if (store === owner) continue
+    const state = store.getState()
+    // A part can land before its message, so parts count on their own.
+    const holdsSession = [state.message, state.session_status, state.permission, state.form]
+      .some((record) => Object.prototype.hasOwnProperty.call(record, sessionId))
+      || Object.values(state.part).some((parts) => parts?.some((part) => part.sessionID === sessionId))
+    if (!holdsSession) continue
+    permissions = withNewRequests(permissions, state.permission[sessionId])
+    forms = withNewRequests(forms, state.form[sessionId])
+    const draft = {
+      message: { ...state.message },
+      part: { ...state.part },
+      session_status: { ...state.session_status },
+      permission: { ...state.permission },
+      form: { ...state.form },
+    }
+    dropSessionCaches(draft, [sessionId])
+    store.setState(draft)
+  }
+  const ownerState = owner.getState()
+  if (permissions.length > 0 && permissions !== ownerState.permission[sessionId]) {
+    owner.setState({ permission: { ...ownerState.permission, [sessionId]: permissions } })
+  }
+  if (forms.length > 0 && forms !== ownerState.form[sessionId]) {
+    owner.setState({ form: { ...ownerState.form, [sessionId]: forms } })
+  }
 }
 
 function relocateSession(session: Session, sourceDirectory: string, destinationDirectory: string): Session {
   invalidateSessionLoads(session.id, [sourceDirectory, destinationDirectory])
   const moved = reconcileSessionMove(session, sourceDirectory, destinationDirectory)
+  dropSessionLiveStateOutside(session.id, destinationDirectory)
   registerSessionDirectory(session.id, destinationDirectory)
   useSessionUIStore.getState().setSessionDirectory(session.id, destinationDirectory)
   return moved
@@ -402,6 +471,36 @@ export async function waitForConnectionOrThrow(): Promise<void> {
     }
   }
   throw connectionLostError()
+}
+
+// ---------------------------------------------------------------------------
+// Compaction
+// ---------------------------------------------------------------------------
+
+type CompactSelection = {
+  providerID: string
+  modelID: string
+  variant?: string | null
+}
+
+/**
+ * OpenCode compacts using the session record, so reconcile an unsent model
+ * pick first. Auto has no prompt to route and leaves the record unchanged.
+ */
+export async function compactSession(
+  sessionId: string,
+  selection: CompactSelection | null,
+  directory?: string | null,
+): Promise<void> {
+  const isCurrentRuntime = captureRuntimeInstance()
+  if (selection && !isAutoModel(selection.providerID, selection.modelID)) {
+    const { model } = resolveSendSelection(sessionId, directory ?? undefined, selection)
+    if (model) {
+      await opencodeClient.switchSessionModel(sessionId, model, directory)
+    }
+  }
+  if (!isCurrentRuntime()) throw new Error("Compaction was cancelled because the runtime changed.")
+  await opencodeClient.compactSession(sessionId, directory)
 }
 
 type SessionListSnapshot = {
@@ -521,17 +620,8 @@ async function fetchSessionMessages(sessionId: string, directory?: string | null
  * target older than that must be searched for across pages, not assumed gone.
  */
 async function findSessionMessageById(sessionId: string, messageId: string, directory?: string | null): Promise<Message | null> {
-  const seenCursors = new Set<string>()
-  let cursor: string | undefined
-  for (;;) {
-    const page = await opencodeClient.getSessionMessages(sessionId, cursor ? { cursor } : undefined, directory)
-    const found = page.items.map(({ info }) => info).find((message) => message.id === messageId)
-    if (found) return found
-    const next = page.cursor.next
-    if (!next || seenCursors.has(next)) return null
-    seenCursors.add(next)
-    cursor = next
-  }
+  const found = await findMessagePageItem(sessionId, (item) => item.info.id === messageId, {}, directory)
+  return found?.info ?? null
 }
 
 /**
@@ -657,15 +747,15 @@ function getSessionReplyDirectory(sessionId?: string): string | undefined {
   return directory ?? dir()
 }
 
-function restoreFilePartsToInput(fileParts: readonly FilePart[]): void {
-  useInputStore.getState().clearAttachedFiles()
+function restoreFilePartsToInput(fileParts: readonly FilePart[], target: ChatDraftIdentity | null): void {
+  useInputStore.getState().clearAttachedFiles(target)
   for (const filePart of fileParts) {
     if (!filePart.url) continue
     useInputStore.getState().addRestoredAttachment({
       url: filePart.url,
       mimeType: filePart.mime,
       filename: filePart.filename ?? "attachment",
-    })
+    }, target)
   }
 }
 
@@ -686,21 +776,6 @@ function contextCarriersForMessage(messages: readonly Message[], messageID: stri
     carriers.unshift({ metadata: candidate.metadata })
   }
   return carriers
-}
-
-/**
- * Where a revert or fork of a user message cuts the transcript: at the first
- * of its context carriers, so the carriers leave together with the message.
- * Cutting at the message itself would leave them in place, and the next prompt
- * would be sent with the reverted context attached a second time.
- */
-function transcriptCutForMessage(messages: readonly Message[], messageID: string): string {
-  const index = messages.findIndex((message) => message.id === messageID)
-  // Only a prompt has carriers; any other target (a subagent run report) is cut at itself.
-  if (messages[index]?.role !== "user") return messageID
-  let first = index
-  while (first > 0 && messages[first - 1].role === "synthetic") first -= 1
-  return first >= 0 ? messages[first].id : messageID
 }
 
 /**
@@ -809,22 +884,6 @@ function resolveDirectoryForBlockingRequest(
   }
 
   return null
-}
-
-function isFormRequestNotFoundError(error: unknown): boolean {
-  if (error && typeof error === "object") {
-    const status = (error as { status?: unknown }).status
-    if (status === 404) return true
-  }
-
-  let message = ""
-  if (error instanceof Error) {
-    message = error.message
-  } else if (typeof error === "string") {
-    message = error
-  }
-
-  return /Form(?:\.)?NotFoundError|Form request not found/i.test(message)
 }
 
 /**
@@ -1001,22 +1060,32 @@ export async function createSession(
   selectionTransition?: "submitted-draft",
   selection?: SessionCreateSelection,
   navigation: "open" | "preserve" = "open",
+  /** An id this client minted (`descendingId("ses")`), so records keyed by it before the response stay valid. */
+  id?: string,
+  expectedRuntimeKey?: string,
 ): Promise<Session | null> {
-  const runtimeKey = getRuntimeKey()
+  const runtimeKey = expectedRuntimeKey ?? getRuntimeKey()
   const runtimeClient = opencodeClient.getSdkClient()
   try {
+    if (getRuntimeKey() !== runtimeKey || opencodeClient.getSdkClient() !== runtimeClient) return null
     // Capture the effective directory used for session creation so we can fall
     // back to it when the server response omits the `directory` field.
     // Without this, setCurrentSession would fall through to a stale
     // opencodeClient.getDirectory() value and group the session under the
     // wrong project (closes #1637, #2270).
     const effectiveDirectory = directoryOverride ?? dir()
+    const cleanupSession = await opencodeClient.captureSessionCleanup(effectiveDirectory, runtimeKey)
+    if (getRuntimeKey() !== runtimeKey || opencodeClient.getSdkClient() !== runtimeClient) return null
+    const sessionMetadata = title ? withUserWorkTitle(metadata ?? {}, title) : metadata
     const session = await opencodeClient.createSession(
-      { title, metadata, model: selection?.model, agent: selection?.agent },
+      { id, title, metadata: sessionMetadata, model: selection?.model, agent: selection?.agent },
       effectiveDirectory,
     )
 
-    if (getRuntimeKey() !== runtimeKey || opencodeClient.getSdkClient() !== runtimeClient) return null
+    if (getRuntimeKey() !== runtimeKey || opencodeClient.getSdkClient() !== runtimeClient) {
+      await cleanupSession(session.id)
+      return null
+    }
     const sessionDirectory = session.directory || effectiveDirectory || null
     // Pre-populate routing index so SSE events arriving before session.created
     // can be routed to the correct child store
@@ -1033,7 +1102,7 @@ export async function createSession(
       }
       getImperativeSessionMessageLoader()?.initializeCreatedSession({ directory: sessionDirectory, sessionID: session.id })
     }
-    if (navigation === "open") useSessionUIStore.getState().setCurrentSession(session.id, sessionDirectory, selectionTransition)
+    if (navigation === "open") useSessionUIStore.getState().setCurrentSession(session.id, sessionDirectory, { transition: selectionTransition })
     useSessionUIStore.getState().markSessionAsOpenChamberCreated(session.id)
     useGlobalSessionsStore.getState().upsertSession(session)
     return session
@@ -1041,6 +1110,18 @@ export async function createSession(
     console.error("[session-actions] createSession failed", error)
     return null
   }
+}
+
+/**
+ * Opens an empty transcript for a session this client is about to create
+ * under `sessionId` in `directory`: events for it route to that store, and
+ * its first message can be shown there before the server answers. The
+ * create response then finds the transcript and leaves it alone.
+ */
+export function openPendingSessionTranscript(sessionId: string, directory: string): void {
+  registerSessionDirectory(sessionId, directory)
+  _childStores?.ensureChild(directory, { bootstrap: false })
+  getImperativeSessionMessageLoader()?.initializeCreatedSession({ directory, sessionID: sessionId })
 }
 
 /**
@@ -1117,28 +1198,66 @@ export async function patchSessionMetadata(
   return updated
 }
 
+/**
+ * Link or unlink one item on a session. The list transform lives on the
+ * OpenChamber server now, decided there from a fresh read inside the
+ * session's write queue: a UI request and an agent's `session.link` can no
+ * longer wipe each other, whichever write lands first.
+ */
 export async function setLinkedIssue(
   sessionId: string,
   directory: string | null | undefined,
   issue: LinkedIssue,
   linked: boolean,
 ): Promise<Session> {
-  return patchSessionMetadata(sessionId, directory, (metadata) =>
-    withLinkedIssue(metadata, issue, linked))
+  return updateLinkedIssues(sessionId, directory, [issue], linked)
 }
 
 /**
- * Link several items in one metadata write. Each write replaces the whole
- * link list, so separate concurrent `setLinkedIssue` calls would keep only
- * the last one's item.
+ * Link several items in one server operation: one write-queue turn applies
+ * all of them, reading and writing the record once.
  */
 export async function addLinkedIssues(
   sessionId: string,
   directory: string | null | undefined,
   issues: readonly LinkedIssue[],
 ): Promise<Session> {
-  return patchSessionMetadata(sessionId, directory, (metadata) =>
-    issues.reduce((current, issue) => withLinkedIssue(current, issue, true), metadata))
+  return updateLinkedIssues(sessionId, directory, issues, true)
+}
+
+async function updateLinkedIssues(
+  sessionId: string,
+  directory: string | null | undefined,
+  issues: readonly LinkedIssue[],
+  linked: boolean,
+): Promise<Session> {
+  const targetDirectory = directory ?? getSessionDirectory(sessionId)
+  // A session no store holds still needs a record for the mirroring, and the
+  // read can fail: taken before the write, a failed read rejects with nothing
+  // landed. The read is display-only — none of the link list comes from the
+  // client — so its ordering is free, and it must not turn into a report of
+  // a link that did land.
+  const heldBeforeRequest = getGlobalSessionSnapshot(sessionId) !== null
+    || findLiveSession(sessionId) !== null
+  const fallbackRecord = heldBeforeRequest
+    ? null
+    : await opencodeClient.getSession(sessionId, targetDirectory)
+  const result = await requestSessionLinksUpdate(sessionId, issues, linked, targetDirectory)
+  if (result.outcome !== "updated") throw new Error(`session link update failed: ${result.reason}`)
+  // The server answered with the merged metadata; the session record is
+  // display-only here. A session a store holds is mirrored from its snapshot
+  // as the response lands; a store-miss uses the record read before the
+  // request. A stale read can no longer corrupt the link list, since none of
+  // it comes from the client.
+  const record = fallbackRecord
+    ?? (getGlobalSessionSnapshot(sessionId) ?? findLiveSession(sessionId))
+    ?? await opencodeClient.getSession(sessionId, targetDirectory)
+  const updated: Session = { ...record, metadata: result.metadata }
+  useGlobalSessionsStore.getState().upsertSession(updated)
+  const sessionDirectory = updated.directory || targetDirectory
+  if (sessionDirectory) registerSessionDirectory(updated.id, sessionDirectory)
+  mirrorSessionIntoLiveStores(updated, sessionDirectory ?? undefined)
+  return updated
 }
 
 /**
@@ -1171,11 +1290,12 @@ export async function setSessionPinned(
   sessionId: string,
   directory: string | null | undefined,
   pinned: boolean,
+  list: string | null = null,
 ): Promise<Session | null> {
   const runtimeKeyAtClick = getRuntimeKey()
   try {
     return await patchSessionMetadata(sessionId, directory, (metadata) =>
-      withSessionPinned(metadata, pinned, Date.now()), runtimeKeyAtClick)
+      withSessionPinned(metadata, pinned, Date.now(), list), runtimeKeyAtClick)
   } catch (error) {
     if (isStaleRuntime(runtimeKeyAtClick)) return null
     throw error
@@ -1189,7 +1309,7 @@ export async function setContextObligatoryMessage(
   pinned: boolean,
 ): Promise<Session> {
   return patchSessionMetadata(sessionId, directory, (metadata) =>
-    withContextObligatoryMessage(metadata, message, pinned))
+    withContextObligatoryMessage(metadata, message, pinned, sessionId))
 }
 
 async function cleanupReviewMetadataBeforeDelete(
@@ -1756,9 +1876,11 @@ function commitArchivedSessions(stamps: SessionArchiveStamp[], directory: string
  * OpenChamber's own (OpenCode has no route for it), so this goes to the
  * OpenChamber unarchive route rather than the OpenCode client.
  *
- * A subsession is the agent's, not the user's: it is never restored on its
- * own. Restoring a top-level session brings its archived subsessions back with
- * it, so the agent runs it holds are whole again.
+ * A subsession is the agent's: under an archived parent it is never restored
+ * on its own. Restoring a top-level session brings its archived subsessions
+ * back with it, so the agent runs it holds are whole again. A subsession
+ * archived alone while its parent stayed active is restored on its own, back
+ * under that parent.
  */
 export async function unarchiveSession(sessionId: string, expectedRuntimeKey = getRuntimeKey()): Promise<boolean> {
   const { restoredIds } = await restoreSessionTree(sessionId, expectedRuntimeKey)
@@ -1766,33 +1888,16 @@ export async function unarchiveSession(sessionId: string, expectedRuntimeKey = g
 }
 
 /** Archived subsessions under a session, each parent before its children. */
-function archivedSubsessionIds(rootId: string): string[] {
-  const childrenByParentId = new Map<string, string[]>()
-  for (const session of useGlobalSessionsStore.getState().archivedSessions) {
-    if (!session.parentID) continue
-    const siblings = childrenByParentId.get(session.parentID) ?? []
-    siblings.push(session.id)
-    childrenByParentId.set(session.parentID, siblings)
-  }
-  const ids: string[] = []
-  const seen = new Set([rootId])
-  const queue = [rootId]
-  for (let index = 0; index < queue.length; index += 1) {
-    for (const childId of childrenByParentId.get(queue[index]) ?? []) {
-      if (seen.has(childId)) continue
-      seen.add(childId)
-      ids.push(childId)
-      queue.push(childId)
-    }
-  }
-  return ids
-}
+const archivedSubsessionIds = (rootId: string): string[] =>
+  readGlobalSessionLineage().descendantsOf(rootId, "archived").map((session) => session.id)
 
 async function restoreSessionTree(
   rootId: string,
   expectedRuntimeKey: string,
 ): Promise<{ restoredIds: string[]; failedIds: string[] }> {
-  if (useGlobalSessionsStore.getState().entityById.get(rootId)?.parentID) {
+  const { entityById } = useGlobalSessionsStore.getState()
+  const root = entityById.get(rootId)
+  if (root && !isRestorableOnItsOwn(root, entityById)) {
     recordSessionActionFailure(rootId, new Error("a subsession is restored with its parent"))
     return { restoredIds: [], failedIds: [rootId] }
   }
@@ -1822,6 +1927,9 @@ async function restoreArchivedSession(sessionId: string, expectedRuntimeKey: str
     }
     const restored = withArchivedAt(sessionId, null)
     if (restored) useGlobalSessionsStore.getState().upsertSession(restored)
+    // Archiving put away whatever the session last did, so a restored session
+    // does not come back unread.
+    markSessionUnreadSeen(sessionId)
     if (sessionDirectory) registerSessionDirectory(sessionId, sessionDirectory)
     promoteRestoredSessionOrdering(sessionId)
     // Archive discarded this session's status. An older directory snapshot
@@ -1869,8 +1977,8 @@ export type UnarchiveSessionsOptions = {
   expectedRuntimeKey?: string
   /**
    * Undo of an archive that just happened: put back exactly the sessions it
-   * moved, subsessions included. Without it a subsession is only restored
-   * with its parent.
+   * moved, subsessions included. Without it a subsession is restored on its
+   * own only while its parent is active (`isRestorableOnItsOwn`).
    */
   undo?: boolean
 }
@@ -1926,7 +2034,7 @@ export async function unarchiveSessions(
 export async function updateSessionTitle(
   sessionId: string,
   title: string,
-  options?: { directory?: string | null; expectedRuntimeKey?: string; signal?: AbortSignal },
+  options?: { directory?: string | null; expectedRuntimeKey?: string; signal?: AbortSignal; byUser?: boolean },
 ): Promise<void> {
   if (isStaleRuntime(options?.expectedRuntimeKey)) throw new Error("runtime changed")
   if (options?.signal) options.signal.throwIfAborted()
@@ -1940,11 +2048,34 @@ export async function updateSessionTitle(
   options?.signal?.throwIfAborted()
   useGlobalSessionsStore.getState().upsertSession(session)
   mirrorSessionIntoLiveStores(session, sessionDirectory)
+  // A name the user gave is theirs: the agent's `work.name` keeps it. The
+  // rename itself has succeeded, so a failed note only lets the agent rename
+  // it later, which is no reason to report the rename as failed.
+  if (options?.byUser) {
+    await patchSessionMetadata(sessionId, sessionDirectory, (metadata) => withUserWorkTitle(metadata, title), options.expectedRuntimeKey)
+      .catch(() => undefined)
+  }
 }
 
 // ---------------------------------------------------------------------------
 // Optimistic message send — insert user message before API call, rollback on error
 // ---------------------------------------------------------------------------
+
+/**
+ * Sets the session's status in its directory store ahead of the server:
+ * busy when the agent's turn has started or is about to, idle when a send
+ * that announced it never reached the server.
+ */
+export function markSessionStatus(sessionId: string, directory: string | null | undefined, type: "busy" | "idle"): void {
+  const store = directory ? dirStoreForDirectory(directory) : dirStore()
+  const current = store.getState()
+  store.setState({
+    session_status: {
+      ...current.session_status,
+      [sessionId]: { type },
+    },
+  })
+}
 
 /**
  * Wraps an async send operation with optimistic user-message insertion.
@@ -1961,15 +2092,19 @@ export async function optimisticSend(input: {
   /** Context admitted ahead of the prompt; shown in the optimistic message until the server echoes it. */
   context?: SyntheticContextInput[]
   /**
-   * Work the request waits for (the session's project knowledge being written
-   * into it). The user message is inserted without waiting for it. Must not
-   * reject.
+   * Work the request waits for: the session being created, its project
+   * knowledge being written into it. The user message is inserted without
+   * waiting for it. A rejection is a definite failure of the send and rolls
+   * the message back.
    */
   ready?: Promise<void>
   appendSubmissions?: () => void
   onOptimisticInsert?: () => void
-  onMessageID?: (messageID: string) => void
-  beforeOptimisticInsert?: () => void
+  /**
+   * Whether the insert marks the session busy (the default). A session that
+   * does not exist yet is marked by its creator once the server has it.
+   */
+  markBusy?: boolean
   /**
    * The actual API call. Receives the optimistic message id and the context
    * with its optimistic ids, so the server's records reconcile in place.
@@ -1991,7 +2126,6 @@ export async function optimisticSend(input: {
 
   assertRuntimeUnchanged()
   await waitForConnectionOrThrow()
-  input.beforeOptimisticInsert?.()
   assertRuntimeUnchanged()
   input.appendSubmissions?.()
 
@@ -2036,7 +2170,6 @@ export async function optimisticSend(input: {
     .filter((item) => item.text.trim())
     .map((item) => ({ ...item, id: ascendingId("msg") }))
   const messageID = ascendingId("msg")
-  input.onMessageID?.(messageID)
   const optimisticIDs = [...context.map((item) => item.id), messageID]
 
   // Part ids follow `partIds`, the same derivation the projection uses for the
@@ -2095,22 +2228,19 @@ export async function optimisticSend(input: {
   })
   input.onOptimisticInsert?.()
 
-  // Set busy status
-  const current = store.getState()
-  store.setState({
-    session_status: {
-      ...current.session_status,
-      [input.sessionId]: { type: "busy" as const },
-    },
-  })
+  if (input.markBusy !== false) markSessionStatus(input.sessionId, targetDirectory, "busy")
 
+  const releasePrompt = trackPromptInFlight(input.sessionId)
+  // Only a request that left can have been accepted; a failure before it is certain.
+  let requestSent = false
   try {
     await input.ready
     assertRuntimeUnchanged()
+    requestSent = true
     await input.send(messageID, context)
   } catch (error) {
     const status = getErrorStatus(error)
-    const ambiguousFailure = isAmbiguousSendFailure(error)
+    const ambiguousFailure = requestSent && isAmbiguousSendFailure(error)
     const acceptedRecords = ambiguousFailure
       ? await fetchRecentSendConfirmationRecords(input.sessionId, messageID, targetDirectory)
       : null
@@ -2146,15 +2276,19 @@ export async function optimisticSend(input: {
     console.warn("[session-actions] prompt send rejected; rolling back optimistic message", failureRecord)
 
     // Rollback via optimistic infrastructure. Context the server admitted
-    // before the failure comes back with the next history read.
+    // before the failure comes back with the next history read. The records
+    // are where the session lives now: a session created from a draft can
+    // have moved to another directory than the one its message was shown in.
+    const rollbackDirectory = getSessionDirectory(input.sessionId) ?? targetDirectory
+    const rollbackStore = rollbackDirectory && rollbackDirectory !== targetDirectory ? dirStoreForDirectory(rollbackDirectory) : store
     for (const optimisticID of optimisticIDs) {
       optimisticRemove({
         sessionID: input.sessionId,
-        directory: targetDirectory,
+        directory: rollbackDirectory,
         messageID: optimisticID,
       })
     }
-    const rollbackState = store.getState()
+    const rollbackState = rollbackStore.getState()
     let session = rollbackState.session
     let message = rollbackState.message
     let part = rollbackState.part
@@ -2173,7 +2307,7 @@ export async function optimisticSend(input: {
       }
     }
 
-    store.setState({
+    rollbackStore.setState({
       session,
       message,
       part,
@@ -2183,6 +2317,8 @@ export async function optimisticSend(input: {
       },
     })
     throw error
+  } finally {
+    releasePrompt()
   }
 }
 
@@ -2401,11 +2537,14 @@ export async function replyToForm(
     // #2448). The later SSE event is a no-op (the reducer only removes when
     // present).
     removeFormRequestFromChildStores(sessionId, formId)
+    noteLocalFormReplied(formId)
   } catch (error) {
     if (isFormRequestNotFoundError(error)) {
       removeFormRequestFromChildStores(sessionId, formId)
       recoverStaleBlockingRequest(sessionId)
     }
+    // Still thrown. Callers must use isFormRequestNotFoundError and must not
+    // toast it as a retryable submit failure: the form is already gone.
     throw error
   }
 }
@@ -2420,13 +2559,85 @@ export async function cancelForm(sessionId: string, formId: string): Promise<voi
     // A successful cancellation is authoritative; see replyToForm for the
     // lost-SSE-event rationale (issues #2911, #2448).
     removeFormRequestFromChildStores(sessionId, formId)
+    noteLocalFormCancelled(formId)
   } catch (error) {
     if (isFormRequestNotFoundError(error)) {
       removeFormRequestFromChildStores(sessionId, formId)
       recoverStaleBlockingRequest(sessionId)
     }
+    // Same as replyToForm: not-found is already settled, not a retryable cancel.
     throw error
   }
+}
+
+/** The model and agent a recovered answer's new turn runs with. */
+type RecoveredAnswerSelection = {
+  providerID: string
+  modelID: string
+  agent?: string
+  variant?: string
+}
+
+/**
+ * The configuration to run a recovered answer with, most specific first: the
+ * model that asked the question (the linked assistant message), then the
+ * session's own record, then the selection this client saved for the session.
+ */
+function recoveredAnswerSelection(question: RecoveredQuestion): RecoveredAnswerSelection {
+  const state = dirStoreForDirectory(question.directory).getState()
+  const message = state.message[question.sessionID]?.find((candidate) => candidate.id === question.toolMessageID)
+  if (message?.role === "assistant") {
+    return {
+      providerID: message.providerID,
+      modelID: message.modelID,
+      agent: message.agent,
+      variant: message.variant,
+    }
+  }
+  const session = state.session.find((candidate) => candidate.id === question.sessionID)
+  if (session?.model) {
+    return {
+      providerID: session.model.providerID,
+      modelID: session.model.id,
+      agent: session.agent,
+      variant: session.model.variant,
+    }
+  }
+  const saved = useSelectionStore.getState().getSessionModelSelection(question.sessionID)
+  if (saved) {
+    return {
+      providerID: saved.providerId,
+      modelID: saved.modelId,
+      agent: useSelectionStore.getState().getSessionAgentSelection(question.sessionID) ?? undefined,
+    }
+  }
+  throw new Error("No model is recorded for this question")
+}
+
+/** Uses the normal send path for rollback and ambiguous-failure confirmation. */
+export async function sendRecoveredFormAnswer(question: RecoveredQuestion, text: string): Promise<void> {
+  const runtimeKey = getRuntimeKey()
+  const isCurrentRuntime = captureRuntimeInstance()
+  await submitRecoveredAnswer(question.form.id, async () => {
+    const selection = recoveredAnswerSelection(question)
+    await useSessionUIStore.getState().sendMessage(
+      text,
+      selection.providerID,
+      selection.modelID,
+      selection.agent,
+      undefined,
+      undefined,
+      undefined,
+      selection.variant,
+      "normal",
+      {
+        userInitiated: true,
+        queuedGoal: null,
+        target: { runtimeKey, sessionId: question.sessionID, directory: question.directory },
+      },
+    )
+    if (isCurrentRuntime()) noteLocalFormReplied(question.form.id)
+  })
 }
 
 /**
@@ -2565,20 +2776,17 @@ export async function revertToMessage(sessionId: string, messageId: string): Pro
 
   // Save input store state before mutations — if the API fails we need to
   // roll back both text and attachments to their previous values.
-  const prevInputAttachments = [...useInputStore.getState().attachedFiles]
-  const prevInputText = useInputStore.getState().pendingInputText
-  const prevInputMode = useInputStore.getState().pendingInputMode
+  const prevRestoreText = useInputStore.getState().pendingSessionRestores.get(sessionId) ?? null
   const draftTarget: InlineCommentDraftTarget | null = directory
     ? { directory, sessionKey: sessionId }
     : null
+  const restoreIdentity = createChatDraftIdentity(getRuntimeKey(), directory, sessionId)
+  const prevTargetAttachments = useInputStore.getState().getAttachedFiles(restoreIdentity)
   const prevDrafts = draftTarget ? useInlineCommentDraftStore.getState().getDrafts(draftTarget) : []
 
   // Restore reverted message text and file attachments to input
   if (messageText) {
-    useInputStore.setState({
-      pendingInputText: messageText,
-      pendingInputMode: "replace" as const,
-    })
+    useInputStore.getState().setPendingSessionRestore(sessionId, messageText)
   }
 
   // Restore file/image attachments from the target message.
@@ -2587,7 +2795,7 @@ export async function revertToMessage(sessionId: string, messageId: string): Pro
   // Only a prompt goes back to the composer: reverting a subagent run report
   // leaves whatever the user is typing alone.
   if (targetMsg?.role === "user") {
-    restoreFilePartsToInput(submittedFileParts)
+    restoreFilePartsToInput(submittedFileParts, restoreIdentity)
     if (draftTarget) restoreContextPartsToInput(submittedContextParts, draftTarget)
   }
 
@@ -2622,12 +2830,9 @@ export async function revertToMessage(sessionId: string, messageId: string): Pro
     store.setState({
       session: rollback,
     })
-    // Rollback input store: restore previous text and attachments
-    useInputStore.setState({
-      pendingInputText: prevInputText,
-      pendingInputMode: prevInputMode,
-      attachedFiles: prevInputAttachments,
-    })
+    // Rollback input store: only this session's attachment slot moves.
+    useInputStore.getState().setPendingSessionRestore(sessionId, prevRestoreText)
+    useInputStore.getState().setAttachedFiles(prevTargetAttachments, restoreIdentity)
     if (draftTarget) {
       useInlineCommentDraftStore.getState().clearDrafts(draftTarget)
       useInlineCommentDraftStore.getState().restoreDrafts(draftTarget, prevDrafts)
@@ -2675,7 +2880,24 @@ function openForkedSession(store: DirectoryStoreApi, forkedSession: Session, dir
  * The objective copy re-reads the fork's goal id first and is skipped when the
  * user armed a new goal on the fork in the meantime.
  */
-function inheritForkMetadata(sourceSessionId: string, forkedSession: Session, directory: string | null | undefined, expectedRuntimeKey: string) {
+async function inheritForkState(sourceSessionId: string, forkedSession: Session, directory: string | null | undefined, expectedRuntimeKey: string) {
+  // VS Code keeps its permission policy in the extension host; other runtimes
+  // inherit it server-side when OpenCode announces session.forked.
+  if (isVSCodeRuntime()) {
+    try {
+      const { usePermissionStore } = await import("@/stores/permissionStore")
+      if (isStaleRuntime(expectedRuntimeKey)) return
+      await usePermissionStore.getState().hydrate()
+      if (isStaleRuntime(expectedRuntimeKey)) return
+      const permissions = usePermissionStore.getState()
+      if (!Object.hasOwn(permissions.modes, forkedSession.id)) {
+        await permissions.setSessionMode(forkedSession.id, permissions.getSessionMode(sourceSessionId))
+      }
+    } catch (error) {
+      console.warn("[fork] failed to copy the permission mode to the fork", error)
+    }
+    if (isStaleRuntime(expectedRuntimeKey)) return
+  }
   return applyForkInheritance(sourceSessionId, forkedSession, {
     readGoalId: async (sessionId) => getSessionGoal(await opencodeClient.getSession(sessionId, directory))?.id ?? null,
     readObjective: fetchGoalObjectiveContent,
@@ -2687,42 +2909,20 @@ function inheritForkMetadata(sourceSessionId: string, forkedSession: Session, di
 }
 
 /**
- * Records that start something new after a turn. OpenCode 1 carried a
- * compaction and a shell run as user messages; OpenCode 2 gives them their own
- * roles, so they have to be named here or a fork after an answer copies them.
- */
-const TURN_BOUNDARY_ROLES = new Set<Message["role"]>(["user", "compaction", "shell"])
-
-const isTurnBoundary = (message: Message): boolean =>
-  TURN_BOUNDARY_ROLES.has(message.role)
-  || readSubagentRun(message) !== undefined
-  || readDispatchedSessionResult(message) !== undefined
-
-/**
  * Fork keeping an assistant turn: the new session holds everything through
- * `messageId`, so the agent there still sees the answer it just gave. The cut
- * is the first record after it that starts something new (a prompt, a
- * compaction, a shell run, a background subagent run, a dispatched session's
- * result); with none, the whole
- * transcript is copied. The composer stays empty since there is no prompt to
- * rewrite.
+ * `messageId`, so the agent there still sees the answer it just gave. The
+ * composer stays empty since there is no prompt to rewrite.
  */
 export async function forkAfterMessage(sessionId: string, messageId: string): Promise<Session | null> {
   const expectedRuntimeKey = getRuntimeKey()
   const { store, directory } = dirStoreForSession(sessionId)
   const messages = store.getState().message[sessionId] ?? []
-  const index = messages.findIndex((message) => message.id === messageId)
-  if (index < 0) throw new Error("Fork source message is not loaded")
-  const boundary = messages.slice(index + 1).find(isTurnBoundary)
 
-  const forkedSession = await opencodeClient.forkSession(sessionId, {
-    before: boundary ? transcriptCutForMessage(messages, boundary.id) : undefined,
-    directory,
-  })
+  const forkedSession = await forkAtTranscriptCut(sessionId, transcriptCutAfterMessage(messages, messageId), directory, expectedRuntimeKey)
   if (isStaleRuntime(expectedRuntimeKey)) return null
   const forkDirectory = resolveSessionOwnedDirectory(forkedSession) ?? directory
   openForkedSession(store, forkedSession, forkDirectory)
-  await inheritForkMetadata(sessionId, forkedSession, forkDirectory, expectedRuntimeKey)
+  await inheritForkState(sessionId, forkedSession, forkDirectory, expectedRuntimeKey)
   return forkedSession
 }
 
@@ -2840,7 +3040,7 @@ export async function forkFromMessage(sessionId: string, messageId: string): Pro
     contextCarriersForMessage(state.message[sessionId] ?? [], messageId),
     { directory: target.directory, sessionKey: forkedSession.id },
   )
-  await inheritForkMetadata(sessionId, forkedSession, target.directory, expectedRuntimeKey)
+  await inheritForkState(sessionId, forkedSession, target.directory, expectedRuntimeKey)
 }
 
 export async function fetchMessagesForSession(sessionID: string, directory?: string | null): Promise<void> {

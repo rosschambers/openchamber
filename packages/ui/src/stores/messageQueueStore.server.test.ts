@@ -287,7 +287,7 @@ describe("server-owned message queue", () => {
       content: "hi @reviewer",
       text: "hi",
       agentMention: "reviewer",
-      attachments: [attachment],
+      attachments: [{ ...attachment, agentPath: '/Users/me/Documents/note.txt' }],
       sendConfig: { providerID: "p", modelID: "m", agent: "build" },
     })
     expect(useMessageQueueStore.getState().queuedMessages[key]).toHaveLength(1)
@@ -303,7 +303,7 @@ describe("server-owned message queue", () => {
           content: "hi @reviewer",
           text: "hi",
           agentMention: "reviewer",
-          attachments: [{ id: "att-1", filename: "note.txt", mimeType: "text/plain", size: 2, source: "local", dataUrl: attachment.dataUrl }],
+          attachments: [{ id: "att-1", filename: "note.txt", mimeType: "text/plain", size: 2, source: "local", dataUrl: attachment.dataUrl, agentPath: '/Users/me/Documents/note.txt' }],
           context: [],
           sendConfig: { providerID: "p", modelID: "m", agent: "build" },
         },
@@ -378,6 +378,22 @@ describe("server-owned message queue", () => {
     expect(taken?.text).toBe("with context")
   })
 
+  test("a message queued as a goal keeps its goal on the server, in the projection, and on take", async () => {
+    const goal = { objective: "the whole plan", tokenBudget: 5000 }
+    respond = () => json({ revision: 9, session: session([serverItem("srv-1", "Implement this plan", { goal })]) })
+    await useMessageQueueStore.getState().addToQueue(target, {
+      content: "Implement this plan",
+      sendConfig: { providerID: "p", modelID: "m" },
+      goal,
+    })
+    expect(calls[0]?.body.item.goal).toEqual(goal)
+    expect(useMessageQueueStore.getState().queuedMessages[key]?.[0]?.goal).toEqual(goal)
+
+    respond = () => json({ revision: 10, session: session([]), item: serverItem("srv-1", "Implement this plan", { goal }) })
+    const [taken] = await useMessageQueueStore.getState().takeForSend(target, "srv-1")
+    expect(taken?.goal).toEqual(goal)
+  })
+
   test("a server item with malformed context is rejected at the boundary", async () => {
     respond = () => new Response(JSON.stringify({
       revision: 8,
@@ -407,7 +423,7 @@ describe("server-owned message queue", () => {
       revision: 7,
       session: session([]),
       item: serverItem("q1", "with file", {
-        attachments: [{ id: "att-1", filename: "note.txt", mimeType: "text/plain", size: 2, source: "local", dataUrl: "data:text/plain;base64,aGk=" }],
+        attachments: [{ id: "att-1", filename: "note.txt", mimeType: "text/plain", size: 2, source: "local", dataUrl: "data:text/plain;base64,aGk=", agentPath: '/Users/me/Documents/note.txt' }],
       }),
     })
     const [taken] = await useMessageQueueStore.getState().takeForSend(target, "q1")
@@ -416,6 +432,7 @@ describe("server-owned message queue", () => {
     expect(calls[0]?.method).toBe("POST")
     expect(taken?.content).toBe("with file")
     expect(taken?.attachments?.[0]?.dataUrl).toBe("data:text/plain;base64,aGk=")
+    expect(taken?.attachments?.[0]?.agentPath).toBe('/Users/me/Documents/note.txt')
     expect(taken?.attachments?.[0]?.file.size).toBe(2)
     expect(useMessageQueueStore.getState().queuedMessages[key]).toBe(undefined)
   })

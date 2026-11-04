@@ -39,6 +39,10 @@ import { DiagnosticDialogAvailableContext } from '@/lib/diagnostics/dialog-avail
 
 const loadSettingsWindow = () => import('@/components/views/SettingsWindow').then(m => m.SettingsWindow);
 
+// Live motion knobs, development builds only: the import is dropped from
+// production bundles.
+const MotionTuningPanel = import.meta.env.DEV ? React.lazy(() => import('@/components/dev/MotionTuningPanel')) : null;
+
 // Surfaces that replace or cover the chat load the first time they open, so
 // the startup bundle carries only the chat. Each reads its own open state from
 // the store once mounted, and stays mounted after its first open.
@@ -52,6 +56,7 @@ const loadArchiveView = () => import('@/components/views/ArchiveView').then((m) 
 const loadIntegrationsCatalogView = () => import('@/components/views/IntegrationsCatalogView').then((m) => m.IntegrationsCatalogView);
 const loadUsageStatsView = () => import('@/components/views/usage/UsageStatsView').then((m) => m.UsageStatsView);
 const loadSourceBoardView = () => import('@/components/sourceBoard/SourceBoardView').then((m) => m.SourceBoardView);
+const loadOverviewView = () => import('@/components/overview/OverviewView').then((m) => m.OverviewView);
 const loadWorktreesView = () => import('@/components/views/WorktreesView').then((m) => m.WorktreesView);
 const loadSpacesView = () => import('@/components/views/SpacesView').then((m) => m.SpacesView);
 const loadSpaceAccessDialog = () => import('@/components/session/spaces/SpaceAccessDialog').then((m) => m.SpaceAccessDialog);
@@ -118,6 +123,7 @@ export const MainLayout: React.FC = () => {
     const isIntegrationsCatalogOpen = useUIStore((state) => state.isIntegrationsCatalogOpen);
     const isUsageStatsPageOpen = useUIStore((state) => state.isUsageStatsPageOpen);
     const isSourceBoardOpen = useUIStore((state) => state.isSourceBoardOpen);
+    const isOverviewOpen = useUIStore((state) => state.isOverviewOpen);
     const worktreesPageProjectId = useUIStore((state) => state.worktreesPageProjectId);
     // The spaces page exists only while the feature's switch is on.
     const isSpacesPageOpen = useUIStore((state) => state.isolatedSpacesEnabled && state.spacesPageProjectId !== null);
@@ -139,7 +145,7 @@ export const MainLayout: React.FC = () => {
     // Any full-page surface replacing the chat area. While open, the chat is
     // fully hidden (not just covered) so none of its floating chrome bleeds
     // through, and selecting a session or draft anywhere closes the surface.
-    const isSurfacePageOpen = isScheduledTasksPageOpen || isArchivePageOpen || isIntegrationsCatalogOpen || isUsageStatsPageOpen || isSourceBoardOpen || Boolean(worktreesPageProjectId) || isSpacesPageOpen || isRunOverviewOpen || Boolean(guestPage);
+    const isSurfacePageOpen = isScheduledTasksPageOpen || isArchivePageOpen || isIntegrationsCatalogOpen || isUsageStatsPageOpen || isSourceBoardOpen || isOverviewOpen || Boolean(worktreesPageProjectId) || isSpacesPageOpen || isRunOverviewOpen || Boolean(guestPage);
     // The work-status card sits in the right slot, outside the hidden chat,
     // so the slot is told to hide it with the chat.
     React.useLayoutEffect(() => {
@@ -230,6 +236,7 @@ export const MainLayout: React.FC = () => {
                                                 </div>
                                             )}
                                             <OnDemand needed={isSourceBoardOpen} load={loadSourceBoardView} onFailure={closeMainSurfaces} />
+                                            <ErrorBoundary><OnDemand needed={isOverviewOpen} load={loadOverviewView} onFailure={closeMainSurfaces} /></ErrorBoundary>
                                             <ErrorBoundary><OnDemand needed={Boolean(worktreesPageProjectId)} load={loadWorktreesView} onFailure={closeMainSurfaces} /></ErrorBoundary>
                                             {isSpacesPageOpen ? <ErrorBoundary><OnDemand needed load={loadSpacesView} onFailure={closeMainSurfaces} /></ErrorBoundary> : null}
                                             {guestPage && <div className="absolute inset-0 z-10 bg-background">
@@ -262,6 +269,9 @@ export const MainLayout: React.FC = () => {
                         open={isSettingsDialogOpen}
                         onOpenChange={setSettingsDialogOpen}
                     />
+                ) : null}
+                {MotionTuningPanel ? (
+                    <React.Suspense fallback={null}><MotionTuningPanel /></React.Suspense>
                 ) : null}
             </div>
             </ProjectActionsProvider>

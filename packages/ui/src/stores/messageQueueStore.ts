@@ -64,6 +64,17 @@ export interface QueuedMessageSendConfig {
 }
 
 /**
+ * "Run as goal" captured with a queued message: the goal starts when this
+ * message is delivered, never with whichever message happens to go out first.
+ * `objective` is present only when the arming flow supplied one (the plan
+ * flow); otherwise the delivered text is the objective.
+ */
+export interface QueuedMessageGoal {
+    objective?: string;
+    tokenBudget: number | null;
+}
+
+/**
  * Context captured with a queued message: whatever the composer had attached
  * when the message was queued. It leaves the composer with the message, so
  * delivery (by the server, or by the auto-send hook in VS Code) carries it and
@@ -109,6 +120,7 @@ export interface QueuedMessage {
     createdAt: number;
     /** Send config captured at queue time — used as-is when auto-sending */
     sendConfig?: QueuedMessageSendConfig;
+    goal?: QueuedMessageGoal;
     scheduledTask?: z.infer<typeof scheduledTaskSchema>;
 }
 
@@ -120,6 +132,7 @@ interface QueuedMessageInput {
     attachments?: AttachedFile[];
     context?: QueuedContextPart[];
     sendConfig?: QueuedMessageSendConfig;
+    goal?: QueuedMessageGoal;
 }
 
 export type MessageQueueTarget = {
@@ -160,6 +173,11 @@ const serverSendConfigSchema = z.object({
     variant: z.string().optional(),
 });
 
+const serverGoalSchema = z.object({
+    objective: z.string().min(1).optional(),
+    tokenBudget: z.number().int().positive().nullable(),
+});
+
 const serverAttachmentSchema = z.object({
     id: z.string(),
     filename: z.string(),
@@ -167,6 +185,8 @@ const serverAttachmentSchema = z.object({
     size: z.number(),
     source: z.enum(['local', 'server', 'vscode']),
     serverPath: z.string().optional(),
+    /** The file's on-disk path, when the runtime resolved one; the model is handed it as the file identity. */
+    agentPath: z.string().optional(),
     /** Present only on a taken item; broadcasts and snapshots omit payloads. */
     dataUrl: z.string().optional(),
 });
@@ -193,6 +213,7 @@ const serverItemBaseSchema = z.object({
     context: z.array(serverContextPartSchema).optional(),
     contextPreview: z.string().optional(),
     sendConfig: serverSendConfigSchema,
+    goal: serverGoalSchema.optional(),
 });
 
 const scheduledTaskSchema = z.object({
@@ -263,6 +284,7 @@ const toAttachedFile = (attachment: ServerQueueAttachment): AttachedFile => {
         source: attachment.source,
     };
     if (attachment.serverPath) file.serverPath = attachment.serverPath;
+    if (attachment.agentPath) file.agentPath = attachment.agentPath;
     return file;
 };
 
@@ -275,6 +297,7 @@ const toQueuedMessage = (item: ServerQueueItem): QueuedMessage => {
     };
     const selection = serverSendConfigSchema.safeParse(item.sendConfig);
     if (selection.success) message.sendConfig = selection.data;
+    if (item.goal) message.goal = item.goal;
     if ('scheduledTask' in item) message.scheduledTask = item.scheduledTask;
     if (item.agentMention) message.agentMention = item.agentMention;
     if (item.attachments.length > 0) message.attachments = item.attachments.map(toAttachedFile);
@@ -293,12 +316,12 @@ type ServerQueueItemInput = {
     context: QueuedContextPart[];
     contextPreview?: string;
     sendConfig: QueuedMessageSendConfig;
+    goal?: QueuedMessageGoal;
 };
 
 type ServerQueueRequestBody =
     | { directory: string; item: ServerQueueItemInput }
-    | { itemIds: string[] }
-    | { held: boolean };
+    | { itemIds: string[] };
 
 const toServerAttachment = (attachment: AttachedFile): ServerQueueAttachmentInput => {
     const input: ServerQueueAttachmentInput = {
@@ -310,6 +333,7 @@ const toServerAttachment = (attachment: AttachedFile): ServerQueueAttachmentInpu
         dataUrl: attachment.dataUrl,
     };
     if (attachment.serverPath) input.serverPath = attachment.serverPath;
+    if (attachment.agentPath) input.agentPath = attachment.agentPath;
     return input;
 };
 
@@ -322,6 +346,7 @@ const toServerItemInput = (message: QueuedMessageInput, sendConfig: QueuedMessag
         sendConfig,
     };
     if (message.agentMention) item.agentMention = message.agentMention;
+    if (message.goal) item.goal = message.goal;
     const contextPreview = getQueuedMessagePreview({ content: '', context: message.context });
     if (contextPreview) item.contextPreview = contextPreview;
     return item;
@@ -433,8 +458,6 @@ interface MessageQueueActions {
      * owner, the host ('') or a space; a session the owner may not speak for is ignored.
      */
     applyServerSession: (session: ServerQueueSession, revision: number, expectedRuntimeKey: string, owner?: string) => void;
-    /** Server-owned queue: tell the server that owns the session's queue to hold or release its delivery. */
-    setServerHold: (sessionId: string, directory: string, held: boolean) => Promise<void>;
     resetForRuntimeSwitch: (previousRuntimeKey: string | null | undefined) => void;
 }
 
@@ -625,6 +648,7 @@ export const useMessageQueueStore = create<MessageQueueStore>()(
                         if (message.agentMention) queuedMessage.agentMention = message.agentMention;
                         if (message.attachments && message.attachments.length > 0) queuedMessage.attachments = message.attachments;
                         if (message.context && message.context.length > 0) queuedMessage.context = message.context;
+                        if (message.goal) queuedMessage.goal = message.goal;
 
                         set((state) => {
                             const currentQueue = state.queuedMessages[key] ?? [];
@@ -900,12 +924,6 @@ export const useMessageQueueStore = create<MessageQueueStore>()(
                     },
 
                     applyServerSession,
-
-                    setServerHold: async (sessionId, directory, held) => {
-                        if (!isServerOwnedMessageQueue()) return;
-                        const response = await runtimeFetch(`${sessionPath(sessionId)}/hold`, { ...jsonInit('PUT', { held }), directory });
-                        if (!response.ok) throw new Error(`Message queue hold request failed (${response.status})`);
-                    },
 
                     resetForRuntimeSwitch: (previousRuntimeKey) => {
                         hydrationGeneration += 1;

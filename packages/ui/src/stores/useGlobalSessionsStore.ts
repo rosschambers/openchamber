@@ -7,6 +7,7 @@ import { getOriginalSessionID, getReviewSessionID } from '@/lib/sessionReviewMet
 import { normalizePath } from '@/lib/pathNormalization';
 import { raiseSessionOrderingBaselines } from '@/sync/session-ordering';
 import { mapWithConcurrency } from '@/lib/concurrency';
+import { captureRuntimeInstance } from '@/lib/runtime-switch';
 import {
   persistGlobalSessionSnapshot,
   persistManagedChatSessions,
@@ -14,6 +15,7 @@ import {
   readManagedChatSessions,
 } from '@/sync/persist-cache';
 import { isVSCodeRuntime } from '@/lib/desktop';
+import { isVSCodeWithoutWorkspace } from '@/lib/vscodeBootstrap';
 import { spaceIdOfDirectory } from '@/lib/spaces/space-route';
 import { useSpacesStore, type SpaceMark } from '@/lib/spaces/spaces-store';
 import { ensureChatsRootDirectory, getChatsRoot } from '@/lib/chatDirectories';
@@ -71,21 +73,41 @@ type GlobalSessionsState = {
 
 const PAGE_SIZE = 500;
 const DIRECTORY_SESSION_REFRESH_CONCURRENCY = 2;
-let directorySessionRefreshActive = 0;
-const directorySessionRefreshWaiters: Array<() => void> = [];
+type DirectoryRefreshEpoch = {
+  isCurrent: () => boolean;
+  active: number;
+  waiters: Array<(admitted: boolean) => void>;
+};
+const createDirectoryRefreshEpoch = (): DirectoryRefreshEpoch => ({ isCurrent: captureRuntimeInstance(), active: 0, waiters: [] });
+let directoryRefreshEpoch = createDirectoryRefreshEpoch();
+
+const getDirectoryRefreshEpoch = (): DirectoryRefreshEpoch => {
+  if (!directoryRefreshEpoch.isCurrent()) {
+    const retired = directoryRefreshEpoch;
+    directoryRefreshEpoch = createDirectoryRefreshEpoch();
+    for (const waiter of retired.waiters) waiter(false);
+    retired.waiters.length = 0;
+  }
+  return directoryRefreshEpoch;
+};
 
 const withDirectorySessionRefreshSlot = async <T>(task: () => Promise<T>): Promise<T> => {
-  if (directorySessionRefreshActive >= DIRECTORY_SESSION_REFRESH_CONCURRENCY) {
-    await new Promise<void>((resolve) => directorySessionRefreshWaiters.push(resolve));
+  const epoch = getDirectoryRefreshEpoch();
+  if (epoch.active >= DIRECTORY_SESSION_REFRESH_CONCURRENCY) {
+    const admitted = await new Promise<boolean>((resolve) => epoch.waiters.push(resolve));
+    if (!admitted) throw new Error('Runtime instance changed');
   } else {
-    directorySessionRefreshActive += 1;
+    epoch.active += 1;
   }
   try {
-    return await task();
+    if (!epoch.isCurrent()) throw new Error('Runtime instance changed');
+    const result = await task();
+    if (!epoch.isCurrent()) throw new Error('Runtime instance changed');
+    return result;
   } finally {
-    const next = directorySessionRefreshWaiters.shift();
-    if (next) next();
-    else directorySessionRefreshActive = Math.max(0, directorySessionRefreshActive - 1);
+    const next = epoch.waiters.shift();
+    if (next) next(true);
+    else epoch.active -= 1;
   }
 };
 
@@ -118,10 +140,14 @@ const getSessionSignature = (session: Session): string => {
   return [
     session.id,
     session.title ?? '',
+    session.agent ?? '',
     session.parentID ?? '',
     session.time?.created ?? 0,
     session.time?.updated ?? 0,
     session.time?.archived ?? 0,
+    // A view changes no `updated`; without these it would read as no change.
+    session.time?.idle ?? 0,
+    session.time?.viewed ?? 0,
     JSON.stringify(session.metadata ?? null),
     resolveGlobalSessionDirectory(session) ?? '',
   ].join(':');
@@ -131,9 +157,14 @@ const getSessionStructuralSignature = (session: Session): string => {
   return [
     session.id,
     session.title ?? '',
+    session.agent ?? '',
     session.parentID ?? '',
     session.time?.created ?? 0,
     session.time?.archived ?? 0,
+    // A finished turn and a view of it decide the unread mark, so they publish
+    // at once instead of waiting with the recency-only updates.
+    session.time?.idle ?? 0,
+    session.time?.viewed ?? 0,
     JSON.stringify(session.metadata ?? null),
     resolveGlobalSessionDirectory(session) ?? '',
   ].join(':');
@@ -255,6 +286,7 @@ const listSessionPage: SessionPageLister = (options) => opencodeClient.listSessi
 const fetchDirectoryPages = async (
   directories: Set<string>,
 ): Promise<DirectoryPageResult> => {
+  const isCurrent = captureRuntimeInstance();
   const currentDirectory = normalizePath(opencodeClient.getDirectory());
   const orderedDirectories = [...directories].sort((left, right) => {
     if (left === currentDirectory) return -1;
@@ -263,15 +295,17 @@ const fetchDirectoryPages = async (
   });
   const results = await mapWithConcurrency(orderedDirectories, DIRECTORY_SESSION_REFRESH_CONCURRENCY, async (directory) => {
     try {
+      if (!isCurrent()) throw new Error('Runtime instance changed');
       return {
         status: 'fulfilled' as const,
         value: {
           directory,
-          // One request per directory, split client-side: archive state is
-          // OpenChamber's own and the session list has no archived filter.
-          sessions: await withDirectorySessionRefreshSlot(() => (
-            listGlobalSessionPages(listSessionPage, { directory, pageSize: PAGE_SIZE })
-          )),
+          // One request per directory, split client-side: OpenCode's archived
+          // filter cannot see sessions the server's archive file marks.
+          sessions: await withDirectorySessionRefreshSlot(() => {
+            if (!isCurrent()) throw new Error('Runtime instance changed');
+            return listGlobalSessionPages(listSessionPage, { directory, pageSize: PAGE_SIZE });
+          }),
         },
       };
     } catch (reason) {
@@ -377,7 +411,7 @@ const applySnapshot = (
       they must not claim the authority `hasLoaded` grants. */
   markLoaded = status === 'ready',
 ): Partial<GlobalSessionsState> | GlobalSessionsState => {
-  if (isVSCodeRuntime()) {
+  if (isVSCodeRuntime() && !isVSCodeWithoutWorkspace()) {
     activeSessions = filterManagedChatsForRuntime(activeSessions, true);
     archivedSessions = filterManagedChatsForRuntime(archivedSessions, true);
   }
@@ -548,7 +582,7 @@ const applySessionMutations = (
   requestedMutations: readonly GlobalSessionMutation[],
 ): Partial<GlobalSessionsState> => {
   let mutations = requestedMutations;
-  if (isVSCodeRuntime()) {
+  if (isVSCodeRuntime() && !isVSCodeWithoutWorkspace()) {
     mutations = requestedMutations.filter((mutation) => (
       mutation.type === 'remove'
       || filterManagedChatsForRuntime([mutation.session], true).length > 0
@@ -712,6 +746,7 @@ export const useGlobalSessionsStore = create<GlobalSessionsState>((set, get) => 
   resetForRuntimeSwitch: () => {
     loadGeneration += 1;
     inflightLoad = null;
+    getDirectoryRefreshEpoch();
     set({
       ...buildManagedChatSessionsState(readPersistedSessionSeed()),
       mutationRevision: 0,

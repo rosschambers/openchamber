@@ -1,20 +1,27 @@
 import { getRuntimeUrlResolver } from './runtime-url';
 import { runtimeFetch } from './runtime-fetch';
 import { useAuthSessionStore, waitForAuthSession } from './runtime-auth-expiry';
+import { getRuntimeExtraHeadersSync } from './runtime-auth';
+import { isCapacitorApp } from './platform';
 import { isRelayModeActive } from './relay/runtime-tunnel';
 import { subscribeRuntimeEndpointChanged } from './runtime-switch';
 import { isVSCodeRuntime } from './desktop';
 import { canDriveBrowserPage } from './browser/hostCapability';
 import { messageQueueUpdatedEventSchema, type MessageQueueUpdatedEvent } from '@/stores/messageQueueStore';
+import { autoReviewUpdatedEventSchema, type AutoReviewUpdatedEvent } from '@/stores/useAutoReviewStore';
+import { prWatchUpdatedEventSchema, type PrWatchUpdatedEvent } from '@/sync/pr-watch';
+import { sessionWarmingSnapshotSchema, type SessionWarmingSnapshot } from '@/stores/useSessionWarmingStore';
 import { z } from 'zod';
 import { trackedItemRecordsSchema } from './trackedItems/model';
+import type { SyncEvent } from './opencode/events';
+import { classifyStreamPayload } from '@/sync/event-pipeline';
 
 type ScheduledTaskRanEvent = {
   type: 'scheduled-task-ran';
   projectId: string;
   taskId: string;
   ranAt: number;
-  status: 'running' | 'success' | 'error';
+  status: 'running' | 'sent' | 'success' | 'error';
   sessionId?: string;
 };
 
@@ -102,6 +109,14 @@ type AgentMemoryChangedEvent = {
 const projectContextChangedSchema = z.object({ projectId: z.string().min(1) });
 type ProjectContextChangedEvent = { type: 'project-context-changed' } & z.infer<typeof projectContextChangedSchema>;
 
+/** A client changed the chat folders; `updatedAt` is the stored revision, so a client already showing it skips the read. */
+const sessionFoldersChangedSchema = z.object({ updatedAt: z.number().finite() });
+type SessionFoldersChangedEvent = { type: 'session-folders-changed' } & z.infer<typeof sessionFoldersChangedSchema>;
+
+/** A client saved, sent or discarded a session draft; every client reads the drafts again. */
+const sessionDraftsChangedSchema = z.object({ updatedAt: z.number().finite() });
+type SessionDraftsChangedEvent = { type: 'session-drafts-changed' } & z.infer<typeof sessionDraftsChangedSchema>;
+
 /**
  * The extension chosen as browser provider can no longer serve (paused,
  * removed, or approval withdrawn), so the server put the in-app browser back.
@@ -112,6 +127,51 @@ const browserProviderResetSchema = z.object({
   guestName: z.string().min(1),
 });
 type BrowserProviderResetEvent = { type: 'browser-provider-reset' } & z.infer<typeof browserProviderResetSchema>;
+
+/**
+ * The set of source-control providers the server serves changed: an extension
+ * that acts as a Git host was approved, enabled, updated, paused or removed.
+ * Carries nothing; listeners re-read the provider list from the server, so the
+ * event cannot go stale between being sent and being handled.
+ */
+type SourceControlProvidersChangedEvent = { type: 'source-control-providers-changed' };
+
+/**
+ * The set of trackers the server serves changed: an extension that acts as a
+ * tracker was approved, enabled, updated, paused or removed, or connected its
+ * server. Carries nothing; listeners re-read the tracker list.
+ */
+type TrackerProvidersChangedEvent = { type: 'tracker-providers-changed' };
+
+/**
+ * The extension catalog changed: an extension was installed, updated, approved,
+ * paused, enabled or removed, or a folder install's files changed. Carries
+ * nothing; listeners re-read the catalog.
+ */
+type GuestsChangedEvent = { type: 'guests-changed' };
+
+/**
+ * A usage limit stopped a session and the server moved on: the provider to
+ * its next account (for every session), or this session to the fallback model.
+ */
+const limitFailoverSchema = z.discriminatedUnion('kind', [
+  z.object({
+    kind: z.literal('account'),
+    sessionId: z.string().min(1),
+    providerId: z.string().min(1),
+    fromAccount: z.string().nullable(),
+    toAccount: z.string().min(1),
+  }),
+  z.object({
+    kind: z.literal('model'),
+    sessionId: z.string().min(1),
+    providerId: z.string().min(1),
+    modelId: z.string().min(1),
+    toProviderId: z.string().min(1),
+    toModelId: z.string().min(1),
+  }),
+]);
+type LimitFailoverEvent = { type: 'limit-failover'; failover: z.infer<typeof limitFailoverSchema> };
 
 /** Jev routing events; each carries what the routing store needs and nothing the UI must re-derive. */
 const routingUpdatedSchema = z.object({
@@ -157,12 +217,21 @@ type RoutingDecisionEvent = { type: 'routing-decision'; decision: z.infer<typeof
 type RoutingPermissionHeldEvent = { type: 'routing-permission-held' } & z.infer<typeof routingPermissionHeldSchema>;
 type RoutingSafetySkippedEvent = { type: 'routing-safety-skipped' } & z.infer<typeof routingSafetySkippedSchema>;
 
+/**
+ * A permission mode change, or a request the server's auto-answer left for the
+ * user. The main event stream carries both as well; a window whose main stream
+ * runs over SSE hears them only here.
+ */
+export type PermissionPolicySyncEvent = Extract<SyncEvent, { type: 'openchamber.permission-auto-accept' | 'openchamber.permission-left-for-user' }>;
+type PermissionPolicyEvent = { type: 'permission-policy'; event: PermissionPolicySyncEvent };
+
 /** Followed pull requests, merge requests or issues whose state the server saw move. */
 type TrackedItemsChangedEvent = { type: 'tracked-items-changed'; records: z.infer<typeof trackedItemRecordsSchema> };
 
 const eventStreamReadySchema = z.object({ connectionId: z.string().min(1).optional() });
 const sourceControlActivitySchema = z.object({ directory: z.string().min(1) });
-const spaceQueueStreamSchema = z.object({ spaceId: z.string().regex(/^[0-9a-f]{12}$/), status: z.literal('connected') });
+// The host follows one isolated space's queue or permission modes again.
+const spaceStreamConnectedSchema = z.object({ spaceId: z.string().regex(/^[0-9a-f]{12}$/), status: z.literal('connected') });
 
 const notificationPropertiesSchema = z.object({
   title: z.string().optional(),
@@ -187,8 +256,15 @@ type OpenChamberEvent =
   | RoutingPermissionHeldEvent
   | RoutingSafetySkippedEvent
   | MessageQueueUpdatedEvent
+  | AutoReviewUpdatedEvent
+  | PrWatchUpdatedEvent
+  | PermissionPolicyEvent
+  /** Which sessions the server keeps warm, as a full snapshot. */
+  | { type: 'session-warming'; snapshot: SessionWarmingSnapshot }
   /** The host follows this space's queue again; what changed in a gap is read from the space. */
   | { type: 'space-queue-stream'; spaceId: string }
+  /** The host follows this space's permission modes again; what changed in a gap is read from the space. */
+  | { type: 'space-permission-stream'; spaceId: string }
   | ScheduledTaskRanEvent
   | SessionCreatedEvent
   | WorktreeChangedEvent
@@ -196,7 +272,13 @@ type OpenChamberEvent =
   | FileOpenRequestEvent
   | PlanOpenRequestEvent
   | BrowserProviderResetEvent
+  | SourceControlProvidersChangedEvent
+  | TrackerProvidersChangedEvent
+  | GuestsChangedEvent
+  | LimitFailoverEvent
   | ProjectContextChangedEvent
+  | SessionFoldersChangedEvent
+  | SessionDraftsChangedEvent
   | AgentMemoryChangedEvent;
 type Listener = (event: OpenChamberEvent) => void;
 
@@ -206,7 +288,7 @@ const worktreeChangedPropertiesSchema = z.object({
 });
 
 let eventSource: EventSource | null = null;
-let relayAbortController: AbortController | null = null;
+let streamAbortController: AbortController | null = null;
 let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
 let authSessionWait: AbortController | null = null;
 let heartbeatTimer: ReturnType<typeof setTimeout> | null = null;
@@ -257,17 +339,17 @@ const scheduleReconnect = () => {
 
 const cleanupSource = () => {
   clearHeartbeatTimer();
-  relayAbortController?.abort();
-  relayAbortController = null;
+  streamAbortController?.abort();
+  streamAbortController = null;
   if (eventSource) {
     eventSource.close();
   }
   eventSource = null;
 };
 
-const connectRelay = (canControlBrowser: boolean) => {
+const connectFetchStream = (canControlBrowser: boolean) => {
   const controller = new AbortController();
-  relayAbortController = controller;
+  streamAbortController = controller;
   void (async () => {
     try {
       const response = await runtimeFetch('/api/openchamber/events', {
@@ -317,7 +399,7 @@ const connectRelay = (canControlBrowser: boolean) => {
     } catch {
       // A failed or ended stream follows the same reconnect path as EventSource.
     }
-    if (relayAbortController !== controller) return;
+    if (streamAbortController !== controller) return;
     cleanupSource();
     scheduleReconnect();
   })();
@@ -396,9 +478,47 @@ const dispatchFromEnvelope = (envelope: { type: string; properties: unknown }) =
     return;
   }
 
+  if (envelope.type === 'openchamber:pr-watch.updated') {
+    const parsed = prWatchUpdatedEventSchema.safeParse(envelope);
+    if (parsed.success) {
+      for (const listener of listeners) listener(parsed.data);
+    }
+    return;
+  }
+
+  if (envelope.type === 'openchamber:auto-review.updated') {
+    const parsed = autoReviewUpdatedEventSchema.safeParse(envelope);
+    if (parsed.success) {
+      for (const listener of listeners) listener(parsed.data);
+    }
+    return;
+  }
+
+  if (envelope.type === 'openchamber:permission-auto-accept.updated' || envelope.type === 'openchamber:permission-auto-accept.left-for-user') {
+    const classified = classifyStreamPayload(envelope, undefined);
+    if (classified.kind !== 'events') return;
+    for (const { event } of classified.events) {
+      if (event.type !== 'openchamber.permission-auto-accept' && event.type !== 'openchamber.permission-left-for-user') continue;
+      for (const listener of listeners) listener({ type: 'permission-policy', event });
+    }
+    return;
+  }
+
+  if (envelope.type === 'openchamber:session-warming') {
+    const parsed = sessionWarmingSnapshotSchema.safeParse(envelope.properties);
+    if (parsed.success) for (const listener of listeners) listener({ type: 'session-warming', snapshot: parsed.data });
+    return;
+  }
+
   if (envelope.type === 'openchamber:space-queue-stream') {
-    const parsed = spaceQueueStreamSchema.safeParse(envelope.properties);
+    const parsed = spaceStreamConnectedSchema.safeParse(envelope.properties);
     if (parsed.success) for (const listener of listeners) listener({ type: 'space-queue-stream', spaceId: parsed.data.spaceId });
+    return;
+  }
+
+  if (envelope.type === 'openchamber:space-permission-stream') {
+    const parsed = spaceStreamConnectedSchema.safeParse(envelope.properties);
+    if (parsed.success) for (const listener of listeners) listener({ type: 'space-permission-stream', spaceId: parsed.data.spaceId });
     return;
   }
 
@@ -448,9 +568,42 @@ const dispatchFromEnvelope = (envelope: { type: string; properties: unknown }) =
     return;
   }
 
+  if (envelope.type === 'openchamber:source-control-providers-changed') {
+    for (const listener of listeners) listener({ type: 'source-control-providers-changed' });
+    return;
+  }
+
+  if (envelope.type === 'openchamber:tracker-providers-changed') {
+    for (const listener of listeners) listener({ type: 'tracker-providers-changed' });
+    return;
+  }
+
+  if (envelope.type === 'openchamber:guests-changed') {
+    for (const listener of listeners) listener({ type: 'guests-changed' });
+    return;
+  }
+
+  if (envelope.type === 'openchamber:limit-failover') {
+    const parsed = limitFailoverSchema.safeParse(envelope.properties);
+    if (parsed.success) for (const listener of listeners) listener({ type: 'limit-failover', failover: parsed.data });
+    return;
+  }
+
   if (envelope.type === 'openchamber:project-context-changed') {
     const parsed = projectContextChangedSchema.safeParse(envelope.properties);
     if (parsed.success) for (const listener of listeners) listener({ type: 'project-context-changed', ...parsed.data });
+    return;
+  }
+
+  if (envelope.type === 'openchamber:session-drafts-changed') {
+    const parsed = sessionDraftsChangedSchema.safeParse(envelope.properties);
+    if (parsed.success) for (const listener of listeners) listener({ type: 'session-drafts-changed', ...parsed.data });
+    return;
+  }
+
+  if (envelope.type === 'openchamber:session-folders-changed') {
+    const parsed = sessionFoldersChangedSchema.safeParse(envelope.properties);
+    if (parsed.success) for (const listener of listeners) listener({ type: 'session-folders-changed', ...parsed.data });
     return;
   }
 
@@ -540,7 +693,7 @@ const dispatchFromEnvelope = (envelope: { type: string; properties: unknown }) =
   const taskId = typeof properties?.taskId === 'string' ? properties.taskId : '';
   const ranAt = typeof properties?.ranAt === 'number' ? properties.ranAt : Date.now();
   const rawStatus = properties?.status;
-  const status = rawStatus === 'running' || rawStatus === 'error' ? rawStatus : 'success';
+  const status = rawStatus === 'running' || rawStatus === 'sent' || rawStatus === 'error' ? rawStatus : 'success';
   if (!projectId || !taskId) {
     return;
   }
@@ -564,7 +717,7 @@ const connect = () => {
   if (typeof window === 'undefined' || listeners.size === 0) {
     return;
   }
-  if (relayAbortController || (eventSource && eventSource.readyState !== EventSource.CLOSED)) {
+  if (streamAbortController || (eventSource && eventSource.readyState !== EventSource.CLOSED)) {
     return;
   }
 
@@ -575,8 +728,10 @@ const connect = () => {
   // driven, and the agent tool needs to know which it is talking to without a
   // setting anyone has to remember to change.
   const canControlBrowser = canDriveBrowserPage();
-  if (isRelayModeActive()) {
-    connectRelay(canControlBrowser);
+  // Native mobile has no desktop realtime proxy. Fetch can attach the saved
+  // instance headers to SSE; EventSource cannot.
+  if (isRelayModeActive() || (Object.keys(getRuntimeExtraHeadersSync()).length > 0 && isCapacitorApp())) {
+    connectFetchStream(canControlBrowser);
     return;
   }
   if (typeof EventSource !== 'function') return;

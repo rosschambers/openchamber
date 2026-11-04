@@ -47,7 +47,7 @@ describe('explicit remote transport configuration', () => {
     credentialRevision: 3,
     providerUserId: 'github.com#42',
     status: 'valid',
-    accessToken: 'canary-private-token',
+    secret: 'canary-private-token',
   };
   const accountReference = () => createHttpsCredentialReference({
     provider: account.provider,
@@ -378,6 +378,16 @@ describe('explicit remote transport configuration', () => {
     expect([...files.values()].join('')).not.toContain('canary-private-token');
   });
 
+  it('refuses a selected credential whose provider user belongs to another instance', async () => {
+    const { service, input, store } = await setup({
+      readTransportAccount: vi.fn(async () => ({ ...resolvedAccount, providerUserId: 'ghe.example.com#42' })),
+    });
+    const { unverifiedConfirmed: _confirmation, ...authority } = input;
+    await expect(service.configureTransportBinding({ ...authority, transport: 'https', credentialAccount: account }))
+      .rejects.toThrow('Selected credential account is unavailable');
+    expect(await store.read(context.repositoryId)).toEqual({ revision: 0, binding: null });
+  });
+
   it('removes one exact committed remote grant while preserving providers, siblings, auxiliary grants, and credentials', async () => {
     const { service, input, readTransportAccount } = await setup();
     const credentialId = accountReference();
@@ -498,7 +508,7 @@ describe('explicit remote transport configuration', () => {
     resolveTransportRepository.mockResolvedValue({ ...context, remotes: [origin] });
     const selectedCredential = {
       id: selectedAccount.accountId, credentialId: selectedAccount.accountId, credentialRevision: 4,
-      providerUserId: 'https://gitlab.example:8443#42', status: 'valid', token: 'private-gitlab-token',
+      providerUserId: 'https://gitlab.example:8443#42', status: 'valid', secret: 'private-gitlab-token',
     };
     readTransportAccount.mockResolvedValue(selectedCredential);
     const { unverifiedConfirmed: _confirmation, ...authority } = input;
@@ -637,6 +647,66 @@ describe('narrow provider association mutations', () => {
       .rejects.toMatchObject({ code: 'INVALID_SOURCE_CONTROL_BINDING' });
     expect(await store.read(context.repositoryId)).toEqual({ revision: 1, binding: before.binding });
   });
+
+  it.each(['gitea', 'forgejo'])('accepts a %s SSH remote that reaches the instance through a host alias', async (providerId) => {
+    const ssh = (url) => ({ displayUrl: redactRemoteUrl(url), fingerprint: fingerprintRemoteUrl(url) });
+    const aliased = { supported: true, repositoryId: 'repo_alias', configRevision: 'config_alias', bare: false,
+      remotes: [{ name: 'origin', fetch: ssh('git@forgejo:owner/repo.git'), push: ssh('git@forgejo:owner/repo.git') }] };
+    const { fsImpl } = createMemoryBindingFs();
+    const store = createBindingStore({ filePath: '/bindings.json', fsImpl });
+    const sshHostReaches = vi.fn(async (host, hostname) => host === 'forgejo' && hostname === 'gitea.example.com');
+    const service = createBindingService({ store, resolveRepository: async () => aliased,
+      resolveTransportRepository: async () => structuredClone(aliased), sshHostReaches });
+    const provider = { provider: providerId, instance: 'https://gitea.example.com', accountId: 'gitea#1', primaryRemote: 'origin' };
+    const before = await service.set(wholeBindingInput('/repo', 0, { providers: [], remotes: [], auxiliary: [], state: 'bound' }, aliased));
+
+    const after = await service.mutateProvider({ directory: '/repo', expectedRepositoryId: aliased.repositoryId,
+      expectedRevision: before.revision, operation: 'add', provider });
+
+    expect(after.binding.providers[0]).toMatchObject({ provider: providerId, readiness: 'ready',
+      endpoint: { displayUrl: 'git@forgejo:owner/repo.git' }, repository: { owner: 'owner', name: 'repo' } });
+    expect(sshHostReaches).toHaveBeenCalledExactlyOnceWith('forgejo', 'gitea.example.com', 'git');
+  });
+
+  it.each(['github', 'gitlab'])('refuses a %s host mismatch even if SSH resolves the alias', async (providerId) => {
+    const url = 'alias:owner/repo.git';
+    const endpoint = { displayUrl: redactRemoteUrl(url), fingerprint: fingerprintRemoteUrl(url) };
+    const aliased = { supported: true, repositoryId: 'repo_alias', configRevision: 'config_alias', bare: false,
+      remotes: [{ name: 'origin', fetch: endpoint, push: endpoint }] };
+    const { fsImpl } = createMemoryBindingFs();
+    const store = createBindingStore({ filePath: '/bindings.json', fsImpl });
+    const sshHostReaches = vi.fn(async () => true);
+    const service = createBindingService({ store, resolveRepository: async () => aliased,
+      resolveTransportRepository: async () => structuredClone(aliased), sshHostReaches });
+    const provider = { provider: providerId, instance: `${providerId}.com`, accountId: 'account#1', primaryRemote: 'origin' };
+    const before = await service.set(wholeBindingInput('/repo', 0, { providers: [], remotes: [], auxiliary: [], state: 'bound' }, aliased));
+
+    await expect(service.mutateProvider({ directory: '/repo', expectedRepositoryId: aliased.repositoryId,
+      expectedRevision: before.revision, operation: 'add', provider })).rejects.toMatchObject({ code: 'INVALID_SOURCE_CONTROL_BINDING' });
+    expect(await store.read(aliased.repositoryId)).toEqual({ revision: before.revision, binding: before.binding });
+    expect(sshHostReaches).not.toHaveBeenCalled();
+  });
+
+  it.each(['git@forgejo:owner/repo.git', 'ssh://git@forgejo:2222/owner/repo.git'])(
+    'refuses an SSH alias with a mismatched or unavailable user: %s', async (remoteUrl) => {
+      const ssh = (url) => ({ displayUrl: redactRemoteUrl(url), fingerprint: fingerprintRemoteUrl(url) });
+      const aliased = { supported: true, repositoryId: 'repo_alias_elsewhere', configRevision: 'config_alias', bare: false,
+        remotes: [{ name: 'origin', fetch: ssh(remoteUrl), push: ssh(remoteUrl) }] };
+      const { fsImpl } = createMemoryBindingFs();
+      const store = createBindingStore({ filePath: '/bindings.json', fsImpl });
+      const sshHostReaches = vi.fn(async (_host, _hostname, user) => user !== 'git');
+      const service = createBindingService({ store, resolveRepository: async () => aliased,
+        resolveTransportRepository: async () => structuredClone(aliased), sshHostReaches });
+      const provider = { provider: 'gitea', instance: 'https://gitea.example.com', accountId: 'gitea#1', primaryRemote: 'origin' };
+      const before = await service.set(wholeBindingInput('/repo', 0, { providers: [], remotes: [], auxiliary: [], state: 'bound' }, aliased));
+
+      await expect(service.mutateProvider({ directory: '/repo', expectedRepositoryId: aliased.repositoryId,
+        expectedRevision: before.revision, operation: 'add', provider })).rejects.toMatchObject({ code: 'INVALID_SOURCE_CONTROL_BINDING' });
+      expect(await store.read(aliased.repositoryId)).toEqual({ revision: before.revision, binding: before.binding });
+      if (remoteUrl.includes('://')) expect(sshHostReaches).not.toHaveBeenCalled();
+      else expect(sshHostReaches).toHaveBeenCalledWith('forgejo', 'gitea.example.com', 'git');
+    },
+  );
 
   it('rejects provider writes when repository topology changes during validation', async () => {
     const { service, store, before, input, resolveRepository } = await setup();
@@ -911,6 +981,30 @@ describe('source-control binding service', () => {
       transportMode: 'managed', credentialId: 'credential_one',
       transportRevision: 'transport_one',
     });
+  });
+
+  it('names the providers whose ready association uses the remote as its primary remote', async () => {
+    const association = (provider, primaryRemote, readiness = 'ready') => ({
+      provider, instance: 'https://review.example.com', accountId: `${provider}-account`, primaryRemote, readiness,
+      endpoint: repository.remotes[0].fetch,
+    });
+    const binding = {
+      repositoryId: 'repo_one', revision: 3, state: 'bound', configRevision: 'config_one', auxiliary: [],
+      providers: [association('gitea', 'origin'), association('gitlab', 'origin', 'account-unavailable'), association('github', 'upstream')],
+      remotes: [{
+        name: 'origin', fetch: repository.remotes[0].fetch, push: repository.remotes[0].push,
+        mode: 'managed', credentialId: 'credential_one', readiness: 'ready',
+      }],
+    };
+    const service = createBindingService({
+      store: { read: vi.fn(async () => ({ revision: 3, binding })), compareAndSwap: vi.fn() },
+      resolveRepository: async () => repository,
+      resolveTransportRepository: async () => transportRepository,
+    });
+    await expect(service.validateGitTransportContext({
+      directory: '/repository', repositoryId: 'repo_one', bindingRevision: 3,
+      configRevision: 'config_one', remote: 'origin', endpointKind: 'push',
+    })).resolves.toMatchObject({ primaryOf: ['gitea'] });
   });
 
   it('requires an exact auxiliary path grant and returns only its endpoint credential', async () => {
